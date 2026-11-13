@@ -1,14 +1,21 @@
 # Software Inventory Exporter
 
-A small, read-only Linux software inventory service written in Rust. It periodically
-collects installed software, serves a cached Prometheus endpoint, and provides a
-more detailed JSON inventory. This is an initial implementation, not a complete
-asset-management, vulnerability-scanning, or audit-history system.
+A read-only software inventory agent and central inventory service written in Rust.
+Collect Linux packages and configured language installations, store complete host
+inventories in SQLite, and assess Arch packages against the Arch security tracker.
+The existing cached Prometheus and JSON exporter remains available.
+
+**Developing on macOS, collecting from Arch:** start with the
+[central inventory guide](docs/central-inventory.md). It includes a local Mac setup,
+agent delivery, database queries, the initial Arch assessment worker, and coverage
+limits. This remains an initial implementation, not a complete asset-management,
+vulnerability-scanning, or audit-history system.
 
 ## Quick start
 
-Requires Linux and a current stable Rust toolchain. This project uses Rust edition
-2024. The included lockfile records the dependencies tested for this release.
+Linux package collection requires Linux. Development, central storage and assessment
+work on macOS and Linux with a current stable Rust toolchain (tested with Rust 1.99.1).
+This project uses Rust edition 2024. The included lockfile records the dependencies tested for this release.
 
 ```bash
 cargo build --release --locked
@@ -191,8 +198,8 @@ Each collector replaces its cache only on success. A successful empty scan
 removes its previous records. A failed scan keeps the previous successful
 records, sets `success=false`, and records an error. A first-ever failed scan
 has no records. Last-known data remains in memory until recovery or restart;
-use success/freshness metrics to avoid treating it as current. There is no
-persistent cache or audit database.
+use success/freshness metrics to avoid treating it as current. The standalone exporter has no persistent cache. Central database storage is
+available through the separate `agent` and `server` commands.
 
 `/healthz` indicates that HTTP is responding. `/readyz` returns 503 until the
 first pass completes, then 200 even if some collectors failed; inspect collector
@@ -266,6 +273,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
 python3 tests/smoke.py target/debug/software-inventory-exporter
+python3 tests/central_smoke.py target/debug/software-inventory-exporter
 ```
 
 Tests cover removed dpkg packages, malformed records, multiple package formats,

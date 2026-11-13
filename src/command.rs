@@ -82,7 +82,7 @@ mod tests {
         );
         assert!(
             run(
-                Path::new("/usr/bin/sleep"),
+                Path::new("/bin/sleep"),
                 &["2"],
                 Duration::from_millis(20),
                 1024

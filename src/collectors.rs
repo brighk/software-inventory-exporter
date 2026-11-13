@@ -54,6 +54,9 @@ pub async fn collect(c: &Collector, config: &Config) -> Result<Vec<Software>> {
         if items.len() > limit {
             bail!("inventory exceeded entry limit");
         }
+        // Reject unrepresentable filesystem paths at the collector boundary so one
+        // bad filename cannot prevent publication of the entire inventory cache.
+        serde_json::to_vec(&items).context("collector contains a path that is not valid UTF-8")?;
         Ok(items)
     }
 }
@@ -360,6 +363,9 @@ fn npm(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
     Ok(items)
 }
 fn filesystem(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
+    if !fs::metadata(&c.path)?.is_dir() {
+        bail!("filesystem root must be a directory: {}", c.path.display());
+    }
     let mut items = Vec::new();
     let mut seen = HashSet::<PathBuf>::new();
     for entry in WalkDir::new(&c.path)

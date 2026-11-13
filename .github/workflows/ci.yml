@@ -2,7 +2,10 @@ name: Rust
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -13,3 +16,4 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 tests/smoke.py target/debug/software-inventory-exporter
+      - run: python3 tests/central_smoke.py target/debug/software-inventory-exporter

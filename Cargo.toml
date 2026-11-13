@@ -3,7 +3,7 @@ name = "software-inventory-exporter"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Read-only Linux software inventory and Prometheus exporter"
+description = "Software inventory agent, central database, Arch advisory assessment and Prometheus exporter"
 
 [dependencies]
 anyhow = "1"
@@ -16,6 +16,10 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "process", "io-util"] }
 toml = "0.8"
 walkdir = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+fs2 = "0.4"
+alpm-types = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

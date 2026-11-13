@@ -1,5 +1,5 @@
 use crate::config::{Collector, Kind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -14,7 +14,7 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Software {
     pub name: String,
     pub version: Option<String>,
@@ -61,7 +61,7 @@ impl Software {
         }
     }
 }
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CollectorState {
     pub max_depth: usize,
     pub source: String,
@@ -73,7 +73,7 @@ pub struct CollectorState {
     pub error: Option<String>,
     pub software: Vec<Software>,
 }
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Inventory {
     pub schema_version: u32,
     pub initial_scan_complete: bool,

@@ -1,8 +1,13 @@
+mod agent;
+mod assessment;
 mod collectors;
 mod command;
 mod config;
+mod database;
 mod metrics;
 mod model;
+mod protocol;
+mod server;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -26,7 +31,7 @@ use tokio::sync::RwLock;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Read-only Linux software inventory and Prometheus exporter"
+    about = "Software inventory agent, central server, Arch assessment and Prometheus exporter"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -42,6 +47,19 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Run the central inventory API and SQLite database.
+    Server {
+        #[arg(long, default_value = "inventory.db")]
+        database: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:9899")]
+        listen: String,
+        #[arg(long)]
+        credentials: PathBuf,
+    },
+    /// Collect and reliably submit inventory to the central server.
+    Agent(agent::Options),
+    /// Assess stored inventory against the Arch security tracker.
+    Assess(assessment::Options),
     /// Scan once. Exit code 2 indicates one or more failed collectors.
     Scan {
         #[arg(long, value_enum, default_value = "json")]
@@ -120,6 +138,17 @@ async fn shutdown() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Action::Server {
+        database,
+        listen,
+        credentials,
+    } = &cli.command
+    {
+        return server::serve(database.clone(), listen, credentials).await;
+    }
+    if let Action::Assess(options) = cli.command {
+        return tokio::select! { result = assessment::run(options) => result, _ = shutdown() => Ok(()) };
+    }
     let mut config = match cli.config {
         Some(path) => toml::from_str::<Config>(
             &std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
@@ -185,6 +214,13 @@ async fn main() -> Result<()> {
         );
     }
     match cli.command {
+        Action::Server { .. } | Action::Assess(_) => unreachable!(),
+        Action::Agent(options) => {
+            tokio::select! {
+                result = agent::run(options, config) => result?,
+                _ = shutdown() => (),
+            }
+        }
         Action::Scan { format } => {
             scan(&mut inv, &config).await;
             match format {

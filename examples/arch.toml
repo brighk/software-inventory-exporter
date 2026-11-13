@@ -1,0 +1,8 @@
+# Real Arch agent configuration. Includes explicitly installed packages and dependencies.
+interval_seconds = 900
+timeout_seconds = 30
+
+[[collectors]]
+id = "os"
+kind = "pacman"
+path = "/usr/bin/pacman"

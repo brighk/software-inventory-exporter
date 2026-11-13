@@ -79,7 +79,11 @@ impl Default for Config {
         ] {
             if std::path::Path::new(path).exists() {
                 collectors.push(Collector {
-                    id: format!("{}-{}", kind.name(), collectors.len()),
+                    id: format!(
+                        "{}-{}",
+                        kind.name(),
+                        path.trim_start_matches('/').replace('/', "-")
+                    ),
                     kind,
                     path: path.into(),
                     max_depth: 4,
