@@ -11,6 +11,8 @@ The server checks Arch Linux packages against the
 [NIST NVD](https://nvd.nist.gov/) CVSS, and exposes everything to Prometheus. A ready-made
 Grafana dashboard shows all software and the software that needs patching.
 
+![Grafana dashboard: health stats, software that needs a patch sorted by CVSS, and all software](docs/images/grafana-dashboard.png)
+
 - **One static binary.** It runs as agent, server, assessment worker or standalone
   exporter. SQLite is bundled, so there is no database service to run.
 - **Push, not scrape.** Agents need no open port. Snapshots are saved to disk and
