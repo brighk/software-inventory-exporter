@@ -24,6 +24,13 @@ pub struct Software {
     pub installation_id: String,
     pub path: Option<PathBuf>,
     pub evidence: String,
+    /// Source package (dpkg source, or the name of an RPM's source RPM). Debian, Ubuntu
+    /// and SUSE advisories name source packages rather than binary packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_package: Option<String>,
+    /// Source package version, when it differs from the binary version (dpkg binNMUs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
 }
 impl Software {
     #[allow(clippy::too_many_arguments)] // One normalized record assembled by each format parser.
@@ -58,7 +65,20 @@ impl Software {
             installation_id: format!("{hash:x}")[..24].into(),
             path,
             evidence: evidence.into(),
+            source_package: None,
+            source_version: None,
         }
+    }
+    /// Records the source package; empty or unknown values are ignored.
+    pub fn with_source(mut self, name: &str, version: &str) -> Self {
+        let known = |v: &str| !v.is_empty() && v != "(none)";
+        if known(name) {
+            self.source_package = Some(name.into());
+            self.source_version = known(version)
+                .then(|| version.to_string())
+                .filter(|v| Some(v) != self.version.as_ref());
+        }
+        self
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

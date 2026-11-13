@@ -6,7 +6,7 @@ One binary, five roles:
 |---|---|---|
 | `agent` | every host (systemd) | collects packages, pushes complete snapshots to the server |
 | `server` | central host / cluster | authenticated API, SQLite database, Prometheus `/metrics` |
-| `assess` | next to the server | Arch security tracker matching and NIST NVD CVSS lookups |
+| `assess` | next to the server | Arch security tracker and OSV.dev matching, NIST NVD CVSS lookups |
 | `serve` / `scan` | any host | standalone exporter mode, see [exporter.md](exporter.md) |
 
 `server` and `assess` share one SQLite file, so they must run on the same machine or
@@ -42,7 +42,8 @@ curl -H "Authorization: Bearer $INVENTORY_READ_TOKEN" http://127.0.0.1:9899/v1/h
 ```
 
 On an Arch machine, use `--config examples/arch.toml` to inventory real pacman packages.
-The npm fixture reports `unsupported`, because assessment covers Arch pacman packages only.
+The npm fixture is looked up in OSV.dev; add `--no-osv` to stay offline (it then reports
+`unsupported`).
 
 ## Agent
 
@@ -63,8 +64,9 @@ software-inventory-exporter --config /etc/software-inventory-exporter/agent.toml
 | `INVENTORY_TOKEN` (env) | This host's upload token (at least 32 characters) |
 
 The scan interval comes from `interval_seconds` in the config file
-(`examples/arch.toml`: 12 hours). `ID_LIKE` is deliberately ignored: EndeavourOS or
-Manjaro report their own ID and are not assessed against the Arch tracker.
+(`examples/arch.toml`: 12 hours). `ID_LIKE` is deliberately ignored: EndeavourOS,
+Manjaro, Linux Mint or Pop!_OS report their own ID and are not assessed against their
+parent distribution's advisories.
 
 ### Delivery semantics
 
@@ -140,12 +142,15 @@ Schema migrations run automatically at startup; back up the database before upgr
 | `hosts` | Identity, OS metadata, `last_seen`, latest sequence |
 | `scans` | Accepted sequences (24 h retention), success, payload digest |
 | `collectors` | Latest attempt, last success, error, active flag |
-| `installations` | Current or last-known records per host and collector |
+| `installations` | Current or last-known records per host and collector, with source package |
 | `advisories` | Latest imported Arch advisories |
 | `assessments` | Per-installation status and advisory/CVE matches |
 | `assessment_state` | Tracker import status |
 | `nvd_cves` | Cached NVD details and selected CVSS per CVE |
 | `nvd_state` | NVD enrichment status |
+| `osv_queries` | Cached OSV advisory IDs per (ecosystem, package, version) |
+| `osv_vulns` | Cached OSV advisory summaries: CVEs, aliases, severity, fixed versions |
+| `osv_state` | OSV query pass status |
 
 ## Assessment
 
@@ -153,21 +158,40 @@ Schema migrations run automatically at startup; back up the database before upgr
 software-inventory-exporter assess --database /var/lib/software-inventory/inventory.db
 ```
 
+Each installation is assessed by one advisory source:
+
+| Host `os` / collector | Source | Package looked up |
+|---|---|---|
+| `arch` / `pacman` | Arch security tracker | package name |
+| `debian` / `dpkg` | OSV `Debian:<major>` | source package and version |
+| `ubuntu` / `dpkg` | OSV `Ubuntu:<VERSION_ID>[:LTS]` | source package and version |
+| `almalinux`, `rocky` / `rpm` | OSV `AlmaLinux:<major>`, `Rocky Linux:<major>` | binary package |
+| `rhel` / `rpm` | OSV `Red Hat:enterprise_linux:<major>::baseos` and `::appstream` | binary package |
+| `opensuse-leap`, `opensuse-tumbleweed` / `rpm` | OSV `openSUSE:Leap <VERSION_ID>`, `openSUSE:Tumbleweed` | source package |
+| any / `python` | OSV `PyPI` | distribution name |
+| any / `npm` | OSV `npm` | package name |
+| any / `cargo` | OSV `crates.io` (crates.io installs only) | crate name |
+
+Everything else (Alpine, Snap, Flatpak, Fedora, SLES, git/path Cargo installs, and
+filesystem entries) is `unsupported`. The host `os` is the os-release `ID`; derivatives
+(`ID_LIKE`) are deliberately not mapped, because their package versions differ.
+
 Every `--interval-seconds` (default 3600) the worker downloads the
-[Arch security tracker feed](https://security.archlinux.org/issues/all.json) and
-re-assesses all installations. Between downloads it checks every minute for newly
-uploaded inventory and assesses it against the last successfully downloaded feed. A
-failed download keeps previous results, is reported in `/v1/assessment-status` and
-`software_inventory_assessment_success`, and suspends cached re-assessment until the
-next successful download. `--feed-file` uses a local feed instead (for tests).
+[Arch security tracker feed](https://security.archlinux.org/issues/all.json) and stores
+it in the database. It checks every minute for newly uploaded inventory, queries OSV for
+packages it has not seen, and re-assesses everything against the stored advisories. A
+failed download keeps the previously imported feed in use and is reported in
+`/v1/assessment-status` and `software_inventory_assessment_success` until the next
+successful download. `--feed-file` uses a local feed instead (for tests). `--no-arch`
+disables the tracker; pacman packages are then `unsupported`.
 
 | Status | Meaning |
 |---|---|
-| `affected` | Installed version equals the advisory's affected version (Vulnerable or Fixed) |
-| `needs_review` | Possible match: below a fixed version, no fixed version, or uncertain tracker data |
+| `affected` | OSV: the installed version is inside an affected range. Arch: it equals the advisory's affected version (Vulnerable or Fixed) |
+| `needs_review` | Possible Arch match: below a fixed version, no fixed version, or uncertain tracker data |
 | `no_known_match` | No applicable advisory. **Not proof of safety** |
-| `unsupported` | Host is not `os=arch` or the collector is not pacman |
-| `not_assessed` | Not assessed yet, or unknown version |
+| `unsupported` | No advisory source for this host and collector (see the table above) |
+| `not_assessed` | Not assessed yet (no feed imported, OSV not queried yet), or unknown version |
 | `pending` | The host uploaded newer inventory since the last assessment |
 | `stale_inventory` | The collector failed or is inactive |
 
@@ -176,6 +200,38 @@ Versions at or above a valid fixed version are excluded using ALPM version order
 introduction bound, so lower versions are review candidates rather than confirmed.
 Many tracker entries stay "Vulnerable" without a fixed version for years. Treat them as
 review items.
+
+### OSV.dev
+
+[OSV.dev](https://osv.dev/) aggregates advisories from Debian, Ubuntu, AlmaLinux, Rocky
+Linux, Red Hat, SUSE, the GitHub Advisory Database, PyPA and RustSec. The worker sends
+each distinct (ecosystem, package, version) to the querybatch API, up to 1000 per
+request. OSV evaluates the version ranges itself, with each ecosystem's ordering rules
+(dpkg, RPM, PEP 440, SemVer), so every returned advisory is `affected`. Advisory records
+are fetched once and refetched only when OSV reports a newer `modified` time.
+
+- **Caching:** results are stored in `osv_queries` and `osv_vulns`. A package version is
+  re-queried after `--osv-refresh-seconds` (default 6 hours). Results for versions no
+  longer installed anywhere are deleted.
+- **Failures:** a failed pass keeps cached results, shows as `software_inventory_osv_success 0`
+  and under `osv` in `/v1/assessment-status`, and is retried after 10 minutes. Packages
+  never queried stay `not_assessed`.
+- **Duplicates:** one vulnerability often has several IDs (a GHSA and a PYSEC record for
+  the same CVE). Findings that alias each other or cover exactly the same CVEs are
+  reported once. Distro notices that bundle several CVEs (DSA, USN) are kept beside
+  per-CVE records.
+- **Fixed version:** the advisory's fix for the installed release branch. When an advisory
+  lists fixes for several branches, the lowest one above the installed version is shown.
+- **Privacy:** only ecosystem, package name and version are sent, never host IDs,
+  hostnames or paths. `--no-osv` disables OSV; `--osv-url` points at a mirror.
+- **Agents:** Debian, Ubuntu and openSUSE advisories name source packages, which agents
+  report from this release on. dpkg records from older agents are `unsupported` until the
+  agent is upgraded.
+
+Debian and Ubuntu track every CVE that touches a package, including unfixed and
+"unimportant" ones, so expect many more findings on those hosts than on Arch. The
+`severity` is the distribution's urgency or priority where OSV provides it (GitHub's
+severity for language packages).
 
 ### CVSS from NIST NVD
 
@@ -196,10 +252,13 @@ has not scored the CVE ("Awaiting Analysis", "Deferred").
 
 ### Coverage limits
 
-Only Arch pacman packages are assessed, by package name. The matcher does not
-distinguish official packages from AUR or custom builds with the same name. It does not
-cover Debian, RPM, Alpine, npm, Python or Cargo packages, and it does not assess
-exploitability or whether vulnerable code is running. An empty findings list is not a
+Arch packages are matched by name, so AUR or custom builds with an official package's
+name are matched too. OSV coverage follows the table above: Alpine, Fedora, SLES, Snap
+and Flatpak are not assessed, and RHEL packages outside BaseOS and AppStream (CodeReady,
+EUS streams) are not matched. Python, npm and Cargo coverage is limited to what the
+collectors find (immediate `node_modules` entries, the configured `site-packages`
+directories, binaries installed with `cargo install`), not dependencies vendored into
+applications. Nothing here assesses exploitability or whether vulnerable code is running. An empty findings list is not a
 clean bill of health: check feed status, assessment time and host freshness. This is a
 triage tool, not a complete vulnerability scanner.
 

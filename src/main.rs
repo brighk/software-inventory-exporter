@@ -8,6 +8,7 @@ mod fleet_metrics;
 mod metrics;
 mod model;
 mod nvd;
+mod osv;
 mod protocol;
 mod server;
 
@@ -33,7 +34,7 @@ use tokio::sync::RwLock;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Software inventory agent, central server, Arch assessment and Prometheus exporter"
+    about = "Software inventory agent, central server, vulnerability assessment and Prometheus exporter"
 )]
 struct Cli {
     #[arg(long, global = true)]
@@ -64,7 +65,7 @@ enum Action {
     },
     /// Collect and reliably submit inventory to the central server.
     Agent(agent::Options),
-    /// Assess stored inventory against the Arch security tracker.
+    /// Assess stored inventory against the Arch security tracker and OSV.dev.
     Assess(assessment::Options),
     /// Scan once. Exit code 2 indicates one or more failed collectors.
     Scan {

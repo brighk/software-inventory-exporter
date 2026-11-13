@@ -1,4 +1,4 @@
-# Central inventory server + Arch assessment worker for k3s.
+# Central inventory server + assessment worker (Arch tracker, OSV.dev, NVD) for k3s.
 # Secrets are NOT in this file; see deploy/k3s/README.md for creating them.
 apiVersion: v1
 kind: Namespace
@@ -42,7 +42,7 @@ spec:
       initContainers:
         # local-path volumes are created root-owned on the node; make the DB dir ours.
         - name: data-permissions
-          image: ghcr.io/brighk/software-inventory-exporter:0.1.0
+          image: ghcr.io/brighk/software-inventory-exporter:0.2.0
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh", "-c", "chown 65532:65532 /data && chmod 700 /data"]
           securityContext:
@@ -52,7 +52,7 @@ spec:
           volumeMounts: [{name: data, mountPath: /data}]
       containers:
         - name: server
-          image: ghcr.io/brighk/software-inventory-exporter:0.1.0
+          image: ghcr.io/brighk/software-inventory-exporter:0.2.0
           imagePullPolicy: IfNotPresent
           args:
             - server
@@ -81,10 +81,11 @@ spec:
             - {name: data, mountPath: /data}
             - {name: credentials, mountPath: /etc/software-inventory, readOnly: true}
         - name: assess
-          image: ghcr.io/brighk/software-inventory-exporter:0.1.0
+          image: ghcr.io/brighk/software-inventory-exporter:0.2.0
           imagePullPolicy: IfNotPresent
-          # Imports https://security.archlinux.org/issues/all.json and re-assesses hourly;
-          # looks up CVSS for referenced CVEs in the NIST NVD API (cached, refreshed weekly).
+          # Imports https://security.archlinux.org/issues/all.json hourly; queries api.osv.dev for
+          # Debian/Ubuntu/RPM/PyPI/npm/crates.io packages (cached, refreshed every 6 h); looks
+          # up CVSS for referenced CVEs in the NIST NVD API (cached, refreshed weekly).
           args: [assess, --database=/data/inventory.db, --interval-seconds=3600]
           env:
             # Optional free key (https://nvd.nist.gov/developers/request-an-api-key) raises the

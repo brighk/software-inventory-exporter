@@ -6,9 +6,10 @@
 Know what software runs on every host, and which of it needs a patch.
 
 A small agent on each Linux host reports every installed package to a central server.
-The server checks Arch Linux packages against the
-[Arch security tracker](https://security.archlinux.org/), scores the matching CVEs with
-[NIST NVD](https://nvd.nist.gov/) CVSS, and exposes everything to Prometheus. A ready-made
+The server checks them against the [Arch security tracker](https://security.archlinux.org/)
+(pacman) and [OSV.dev](https://osv.dev/) (Debian, Ubuntu, RPM distributions, Python, npm
+and Cargo), scores the matching CVEs with [NIST NVD](https://nvd.nist.gov/) CVSS, and
+exposes everything to Prometheus. A ready-made
 Grafana dashboard shows all software and the software that needs patching.
 
 ![Grafana dashboard: health stats, software that needs a patch sorted by CVSS, and all software](docs/images/grafana-dashboard.png)
@@ -17,8 +18,10 @@ Grafana dashboard shows all software and the software that needs patching.
   exporter. SQLite is bundled, so there is no database service to run.
 - **Push, not scrape.** Agents need no open port. Snapshots are saved to disk and
   delivered after outages.
-- **Arch-aware matching.** Versions are compared with ALPM ordering (epochs, package
-  releases). Uncertain matches are labelled `needs_review` rather than hidden or overstated.
+- **Distro-aware matching.** Arch packages are compared with ALPM ordering; OSV.dev
+  evaluates dpkg, RPM, PEP 440 and SemVer ranges, using source packages where Debian,
+  Ubuntu and SUSE advisories expect them. Uncertain Arch matches are labelled
+  `needs_review` rather than hidden or overstated.
 - **CVSS from NVD.** Cached and rate-limited, with an optional free API key.
 - **Prometheus and Grafana built in.** Includes a ServiceMonitor and a dashboard for
   kube-prometheus-stack.
@@ -26,9 +29,10 @@ Grafana dashboard shows all software and the software that needs patching.
   agent runs as an unprivileged systemd unit; the containers are non-root with
   read-only filesystems.
 
-> **Status:** early (0.x). Vulnerability assessment currently covers **Arch Linux pacman
-> packages only**. Inventory collection also supports dpkg, rpm, apk, Snap, Flatpak,
-> Python, npm and Cargo. See [coverage limits](docs/operations.md#coverage-limits).
+> **Status:** early (0.x). Vulnerability assessment covers Arch (pacman), Debian and
+> Ubuntu (dpkg), AlmaLinux, Rocky Linux, RHEL and openSUSE (rpm), and Python, npm and
+> Cargo packages. Alpine, Snap, Flatpak, Fedora and SLES are inventoried but not assessed.
+> See [coverage limits](docs/operations.md#coverage-limits).
 
 ## How it works
 
@@ -37,7 +41,8 @@ Grafana dashboard shows all software and the software that needs patching.
  ┌────────────────────┐   HTTPS    ┌──────────────────────────────────────────┐
  │ agent (systemd)    │ ─────────► │ server ── SQLite ── assess               │
  │  pacman -Q / dpkg… │  push, 12h │   │                   ├ Arch tracker (1h)│
- │  durable snapshot  │            │   │ /metrics          └ NIST NVD CVSS    │
+ │  durable snapshot  │            │   │                   ├ OSV.dev (6h)     │
+ │                    │            │   │ /metrics          └ NIST NVD CVSS    │
  └────────────────────┘            └───┼──────────────────────────────────────┘
                                        ▼
                                Prometheus ──► Grafana dashboard
@@ -85,12 +90,12 @@ self-signed CA, add `--ca-cert /path/to/ca.pem`.
 Open the **Software Inventory** dashboard in Grafana:
 
 - **Software that needs a patch:** advisory matches with CVSS score and severity,
-  installed and fixed versions, and links to the Arch advisory and NVD entry. Sorted by
-  CVSS.
+  installed and fixed versions, and links to the advisory (Arch tracker or OSV.dev) and
+  NVD entry. Sorted by CVSS.
 - **All software:** every package on every host, with its assessment status. It can be
   filtered by host and package name.
 - **Health:** hosts reporting, oldest report, findings with CVSS ≥ 7, and the status of
-  the tracker and NVD lookups.
+  the advisory feeds and NVD lookups.
 
 To try everything on one machine without Kubernetes, follow
 [local development](docs/operations.md#local-development).
@@ -99,11 +104,11 @@ To try everything on one machine without Kubernetes, follow
 
 | Status | Meaning |
 |---|---|
-| `affected` | Installed version equals the advisory's affected version |
-| `needs_review` | Possible match: below a fixed version, no fix published, or uncertain data |
+| `affected` | OSV: installed version is in an affected range. Arch: equals the affected version |
+| `needs_review` | Possible Arch match: below a fixed version, no fix published, or uncertain data |
 | `no_known_match` | No applicable advisory. **Not proof of safety** |
 | `pending` | New inventory arrived; it is assessed within a minute |
-| `unsupported` | Not an Arch host, or not a pacman package |
+| `unsupported` | No advisory source for this distribution or collector |
 | `not_assessed` / `stale_inventory` | No assessment yet / the collector failed or was removed |
 
 ## Prometheus metrics
@@ -113,11 +118,12 @@ All metrics come from the server's `/metrics` endpoint, which requires the read 
 | Metric | Labels / value |
 |---|---|
 | `software_inventory_package_info` | `host_id`, `hostname`, `collector`, `name`, `version`, `status` |
-| `software_inventory_vulnerability_info` | package labels plus `advisory`, `severity`, `cves`, `fixed_version`, `patch_available`, `finding_status`, `tracker_status`, `cvss_score`, `cvss_severity`, `cvss_version`, `cvss_cve` |
+| `software_inventory_vulnerability_info` | package labels plus `advisory`, `source` (`arch`/`osv`), `advisory_url`, `severity`, `cves`, `fixed_version`, `patch_available`, `finding_status`, `tracker_status`, `cvss_score`, `cvss_severity`, `cvss_version`, `cvss_cve` |
 | `software_inventory_vulnerability_cvss_score` | highest NVD CVSS base score of a finding |
 | `software_inventory_host_last_seen_timestamp_seconds` | server receipt time of the latest upload |
 | `software_inventory_collector_success` | latest collector attempt succeeded |
-| `software_inventory_assessment_success`, `…_last_success_timestamp_seconds` | Arch tracker import |
+| `software_inventory_assessment_success`, `…_last_success_timestamp_seconds` | Arch tracker import (1 when disabled) |
+| `software_inventory_osv_success`, `…_last_success_timestamp_seconds` | OSV.dev query pass |
 | `software_inventory_nvd_success`, `…_last_success_timestamp_seconds`, `software_inventory_nvd_pending_cves` | NVD lookups |
 
 ```promql
@@ -172,6 +178,9 @@ OS package, so don't sum records to count unique applications. See
 - **Transport:** the server speaks HTTP and binds to loopback by default. Agents require
   HTTPS for anything that isn't loopback, so put the server behind a TLS reverse proxy
   or a VPN.
+- **What leaves the network:** the assessment worker sends package names and versions
+  (never host IDs or hostnames) to `api.osv.dev`, and CVE IDs to NVD. Use `--no-osv` if
+  that is not acceptable.
 - **Least privilege:** the agent only reads package databases, as an unprivileged
   `DynamicUser`. Containers run as non-root with read-only root filesystems and all
   capabilities dropped.

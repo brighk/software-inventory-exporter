@@ -83,6 +83,9 @@ impl Submission {
                     || item.source != source
                     || item.name.trim().is_empty()
                     || item.name.len() > 4096
+                    || [&item.source_package, &item.source_version]
+                        .iter()
+                        .any(|v| v.as_ref().is_some_and(|v| v.is_empty() || v.len() > 4096))
                     || item.installation_id.len() != 24
                     || !item.installation_id.bytes().all(|b| b.is_ascii_hexdigit())
                     || !identities.insert((&item.installation_id, &item.version))

@@ -35,7 +35,8 @@ To try the full system locally, see [local development](docs/operations.md#local
 | `src/model.rs`, `src/metrics.rs` | Inventory records; standalone exporter metrics |
 | `src/agent.rs`, `src/protocol.rs` | Agent with durable delivery; versioned upload contract |
 | `src/server.rs`, `src/database.rs`, `src/*.sql` | API, SQLite schema and migrations |
-| `src/assessment.rs` | Arch tracker import and matching |
+| `src/assessment.rs` | Arch tracker import and matching; the assessment pass |
+| `src/osv.rs` | OSV.dev ecosystem mapping, queries, cache and findings |
 | `src/nvd.rs` | NVD CVSS enrichment |
 | `src/fleet_metrics.rs` | Central `/metrics` |
 | `deploy/k3s/` | Kubernetes manifests and Grafana dashboard generator |
@@ -53,10 +54,13 @@ To try the full system locally, see [local development](docs/operations.md#local
 
 ## Adding vulnerability coverage for another distro
 
-Assessment is Arch-only today. Coverage for Debian/Ubuntu, RHEL or Alpine would follow
-`src/assessment.rs`: import the distro's advisory feed, compare versions with that
-distro's ordering rules, and keep uncertain cases as `needs_review`. Please open an
-issue to discuss the data source first.
+Arch uses the Arch security tracker (`src/assessment.rs`); everything else goes through
+OSV.dev (`src/osv.rs`). If OSV publishes an ecosystem for the distribution (see
+[ecosystems.txt](https://osv-vulnerabilities.storage.googleapis.com/ecosystems.txt)),
+coverage is usually a new arm in `osv::queries`: map the os-release `ID`/`VERSION_ID` to
+the ecosystem string and decide whether its advisories name binary or source packages.
+Verify the mapping against the live API before opening a pull request. Alpine (`apk`) is
+the obvious next one; it needs the origin package from the APK database.
 
 ## Releases
 

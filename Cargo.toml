@@ -1,9 +1,9 @@
 [package]
 name = "software-inventory-exporter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Software inventory agent, central database, Arch advisory assessment and Prometheus exporter"
+description = "Software inventory agent, central database, Arch and OSV vulnerability assessment and Prometheus exporter"
 rust-version = "1.95"
 repository = "https://github.com/brighk/software-inventory-exporter"
 readme = "README.md"

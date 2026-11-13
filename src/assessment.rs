@@ -28,8 +28,21 @@ pub struct Options {
     /// Use a local Arch tracker JSON fixture instead of downloading the feed.
     #[arg(long)]
     feed_file: Option<PathBuf>,
+    /// How often the Arch security tracker feed is downloaded.
     #[arg(long, default_value_t = 3600)]
     interval_seconds: u64,
+    /// Disable the Arch security tracker (pacman packages become unsupported).
+    #[arg(long)]
+    no_arch: bool,
+    /// Disable OSV.dev matching for Debian, Ubuntu, RPM distributions, PyPI, npm and crates.io.
+    #[arg(long)]
+    no_osv: bool,
+    /// OSV API base URL.
+    #[arg(long, default_value = crate::osv::DEFAULT_URL)]
+    osv_url: String,
+    /// Re-query cached OSV results older than this.
+    #[arg(long, default_value_t = 6 * 3600)]
+    osv_refresh_seconds: u64,
     #[arg(long)]
     once: bool,
     /// Disable CVSS enrichment from the NIST NVD API.
@@ -81,6 +94,23 @@ fn classify(version: &str, advisory: &Advisory) -> Option<&'static str> {
     }
 }
 
+/// Advisory sources enabled for an assessment.
+#[derive(Clone, Copy)]
+pub struct Sources {
+    pub arch: bool,
+    pub osv: bool,
+}
+
+fn summarize(findings: &[Value]) -> &'static str {
+    if findings.iter().any(|f| f["status"] == "affected") {
+        "affected"
+    } else if !findings.is_empty() {
+        "needs_review"
+    } else {
+        "no_known_match"
+    }
+}
+
 fn parse_feed(bytes: &[u8]) -> Result<Vec<Advisory>> {
     let feed: Vec<Advisory> =
         serde_json::from_slice(bytes).context("invalid Arch advisory feed")?;
@@ -102,28 +132,86 @@ fn parse_feed(bytes: &[u8]) -> Result<Vec<Advisory>> {
 }
 
 impl Database {
-    pub fn assess(&mut self, bytes: &[u8], source: &str) -> Result<()> {
+    /// Replaces the stored Arch advisories with a downloaded feed.
+    pub fn import_arch(&mut self, bytes: &[u8], source: &str) -> Result<usize> {
         let advisories = parse_feed(bytes)?;
-        let mut by_package: HashMap<&str, Vec<&Advisory>> = HashMap::new();
-        for advisory in &advisories {
-            for package in &advisory.packages {
-                by_package.entry(package).or_default().push(advisory);
-            }
-        }
         let tx = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = model::now() as i64;
-        tx.execute("DELETE FROM advisories", [])?;
+        tx.execute("DELETE FROM advisories WHERE source='arch'", [])?;
         for advisory in &advisories {
             tx.execute(
                 "INSERT INTO advisories(id,source,data) VALUES (?1,'arch',?2)",
                 params![advisory.name, serde_json::to_string(advisory)?],
             )?;
         }
+        let now = model::now() as i64;
+        tx.execute("INSERT INTO assessment_state(id,last_attempt,last_success,success,feed_sha256,feed_source) VALUES (1,?1,?1,1,?2,?3)
+            ON CONFLICT(id) DO UPDATE SET last_attempt=excluded.last_attempt,last_success=excluded.last_success,success=1,error=NULL,
+            feed_sha256=excluded.feed_sha256,feed_source=excluded.feed_source",
+            params![now,format!("{:x}",Sha256::digest(bytes)),source])?;
+        tx.commit()?;
+        Ok(advisories.len())
+    }
+
+    /// Stored Arch advisories, or `None` when no feed was ever imported.
+    fn arch_advisories(&self) -> Result<Option<Vec<Advisory>>> {
+        let imported: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM assessment_state WHERE feed_sha256 IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if !imported {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .0
+            .prepare("SELECT data FROM advisories WHERE source='arch'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut advisories = Vec::new();
+        for row in rows {
+            advisories.push(serde_json::from_str(&row?)?);
+        }
+        Ok(Some(advisories))
+    }
+
+    /// Records that the Arch tracker is disabled, so its state does not read as a failure.
+    fn arch_disabled(&self) -> Result<()> {
+        self.0.execute("INSERT INTO assessment_state(id,last_attempt,last_success,success,feed_source) VALUES (1,?1,?1,1,'disabled')
+            ON CONFLICT(id) DO UPDATE SET last_attempt=excluded.last_attempt,last_success=excluded.last_success,success=1,error=NULL,
+            feed_source='disabled'", [model::now() as i64])?;
+        Ok(())
+    }
+
+    /// Re-assesses every installation from the stored Arch advisories and the OSV cache.
+    pub fn assess(&mut self, sources: Sources) -> Result<()> {
+        let arch = if sources.arch {
+            self.arch_advisories()?
+        } else {
+            self.arch_disabled()?;
+            None
+        };
+        let mut by_package: HashMap<&str, Vec<&Advisory>> = HashMap::new();
+        for advisory in arch.iter().flatten() {
+            for package in &advisory.packages {
+                by_package.entry(package).or_default().push(advisory);
+            }
+        }
+        let osv = if sources.osv {
+            Some(self.osv_cache()?)
+        } else {
+            // Like a disabled Arch tracker, a disabled OSV source is not a failure.
+            self.osv_result(None)?;
+            None
+        };
+        let tx = self
+            .0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = model::now() as i64;
         tx.execute("DELETE FROM assessments", [])?;
         {
-            let mut stmt = tx.prepare("SELECT i.host_id,i.collector_id,i.installation_id,i.version,i.name,i.source,h.os,h.last_sequence,c.success,c.active
+            let mut stmt = tx.prepare("SELECT i.host_id,i.collector_id,i.installation_id,i.version,i.name,i.source,h.os,h.last_sequence,c.success,c.active,
+                h.os_version,i.source_package,i.source_version,i.evidence
                 FROM installations i JOIN hosts h ON h.id=i.host_id JOIN collectors c ON c.host_id=i.host_id AND c.id=i.collector_id")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
@@ -137,40 +225,72 @@ impl Database {
                 let sequence: i64 = row.get(7)?;
                 let successful: bool = row.get(8)?;
                 let active: bool = row.get(9)?;
+                let os_version: String = row.get(10)?;
+                let source_package: Option<String> = row.get(11)?;
+                let source_version: Option<String> = row.get(12)?;
+                let evidence: String = row.get(13)?;
                 let mut findings = Vec::new();
+                let package = crate::osv::Package {
+                    os: &os,
+                    os_version: &os_version,
+                    kind: &ecosystem,
+                    name: &name,
+                    version: version.as_deref().unwrap_or(""),
+                    source_package: source_package.as_deref(),
+                    source_version: source_version.as_deref(),
+                    evidence: &evidence,
+                };
+                let is_arch = os == "arch" && ecosystem == "pacman";
+                let osv_queries = crate::osv::queries(&package);
                 let status = if !successful || !active {
                     "stale_inventory"
-                } else if os != "arch" || ecosystem != "pacman" {
-                    "unsupported"
-                } else if let Some(version) = &version {
-                    if let Some(records) = by_package.get(name.as_str()) {
-                        for advisory in records {
+                } else if version.is_none() {
+                    if is_arch || osv_queries.is_some() {
+                        "not_assessed"
+                    } else {
+                        "unsupported"
+                    }
+                } else if is_arch && sources.arch {
+                    if arch.is_none() {
+                        "not_assessed"
+                    } else {
+                        let version = version.as_deref().unwrap_or("");
+                        for advisory in by_package.get(name.as_str()).into_iter().flatten() {
                             if let Some(status) = classify(version, advisory) {
-                                findings.push(json!({"advisory_id":advisory.name,"cves":advisory.issues,
-                                        "severity":advisory.severity,"status":status,"fixed_version":advisory.fixed,
-                                        "tracker_status":advisory.status}));
+                                findings.push(json!({"source":"arch","advisory_id":advisory.name,
+                                    "advisory_url":format!("https://security.archlinux.org/{}",advisory.name),
+                                    "cves":advisory.issues,"severity":advisory.severity,"status":status,
+                                    "fixed_version":advisory.fixed,"tracker_status":advisory.status}));
                             }
                         }
+                        summarize(&findings)
                     }
-                    if findings.iter().any(|f| f["status"] == "affected") {
-                        "affected"
-                    } else if !findings.is_empty() {
-                        "needs_review"
+                } else if let (Some(queries), Some(cache)) = (&osv_queries, &osv) {
+                    let mut complete = true;
+                    for query in queries {
+                        match cache.queries.get(query) {
+                            Some(ids) => findings.extend(ids.iter().filter_map(|id| {
+                                crate::osv::finding(query, id, cache.vulns.get(id))
+                            })),
+                            None => complete = false,
+                        }
+                    }
+                    if complete {
+                        findings = crate::osv::dedupe(findings);
+                        summarize(&findings)
                     } else {
-                        "no_known_match"
+                        // Never report "no_known_match" for a package OSV was not asked about.
+                        findings.clear();
+                        "not_assessed"
                     }
                 } else {
-                    "not_assessed"
+                    "unsupported"
                 };
                 tx.execute("INSERT INTO assessments(host_id,collector_id,installation_id,version,name,sequence,assessed_at,status,findings)
                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![host,collector,identity,version.unwrap_or_default(),name,sequence,now,status,serde_json::to_string(&findings)?])?;
             }
         }
-        tx.execute("INSERT INTO assessment_state(id,last_attempt,last_success,success,feed_sha256,feed_source) VALUES (1,?1,?1,1,?2,?3)
-            ON CONFLICT(id) DO UPDATE SET last_attempt=excluded.last_attempt,last_success=excluded.last_success,success=1,error=NULL,
-            feed_sha256=excluded.feed_sha256,feed_source=excluded.feed_source",
-            params![now,format!("{:x}",Sha256::digest(bytes)),source])?;
         tx.commit()?;
         Ok(())
     }
@@ -180,11 +300,17 @@ impl Database {
             params![model::now() as i64,error])?;
         Ok(())
     }
+    /// Arch tracker import state, with the OSV query state under `osv`.
     pub fn assessment_status(&self) -> Result<Value> {
-        Ok(self.0.query_row("SELECT last_attempt,last_success,success,error,feed_sha256,feed_source FROM assessment_state WHERE id=1",[],|r| Ok(json!({
+        let mut status = self.0.query_row("SELECT last_attempt,last_success,success,error,feed_sha256,feed_source FROM assessment_state WHERE id=1",[],|r| Ok(json!({
             "last_attempt":r.get::<_,i64>(0)?,"last_success":r.get::<_,Option<i64>>(1)?,"success":r.get::<_,bool>(2)?,
             "error":r.get::<_,Option<String>>(3)?,"feed_sha256":r.get::<_,Option<String>>(4)?,"feed_source":r.get::<_,Option<String>>(5)?
-        }))).optional()?.unwrap_or(json!({"success":false,"last_success":null,"error":"not assessed"})))
+        }))).optional()?.unwrap_or(json!({"success":false,"last_success":null,"error":"not assessed"}));
+        status["osv"] = self.0.query_row("SELECT last_attempt,last_success,success,error FROM osv_state WHERE id=1",[],|r| Ok(json!({
+            "last_attempt":r.get::<_,i64>(0)?,"last_success":r.get::<_,Option<i64>>(1)?,"success":r.get::<_,bool>(2)?,
+            "error":r.get::<_,Option<String>>(3)?
+        }))).optional()?.unwrap_or(Value::Null);
+        Ok(status)
     }
     pub fn findings(
         &self,
@@ -274,10 +400,20 @@ impl Database {
     }
 }
 
+/// Wait before retrying OSV after a failed pass.
+const OSV_RETRY: Duration = Duration::from_secs(600);
+
 pub async fn run(options: Options) -> Result<()> {
-    if options.interval_seconds == 0 {
-        bail!("interval must be positive");
+    if options.interval_seconds == 0 || options.osv_refresh_seconds == 0 {
+        bail!("intervals must be positive");
     }
+    if options.no_arch && options.no_osv {
+        bail!("--no-arch and --no-osv together leave nothing to assess");
+    }
+    let sources = Sources {
+        arch: !options.no_arch,
+        osv: !options.no_osv,
+    };
     let nvd = (!options.no_nvd).then(|| crate::nvd::Options {
         url: options.nvd_url.clone(),
         api_key: std::env::var("NVD_API_KEY")
@@ -294,80 +430,211 @@ pub async fn run(options: Options) -> Result<()> {
             tokio::spawn(crate::nvd::run(options.database.clone(), nvd));
         }
     }
+    let osv = crate::osv::Options {
+        url: options.osv_url.clone(),
+        refresh_seconds: options.osv_refresh_seconds,
+    };
     let source = options
         .feed_file
         .as_ref()
         .map(|p| format!("file:{}", p.display()))
         .unwrap_or(FEED_URL.into());
-    // Last successfully assessed feed, reused to assess new inventory between downloads.
-    let mut cached: Option<std::sync::Arc<Vec<u8>>> = None;
     let mut next_download = tokio::time::Instant::now();
+    let mut next_osv = tokio::time::Instant::now();
     loop {
-        let refresh = tokio::time::Instant::now() >= next_download;
-        let bytes = if refresh {
+        let mut changed = false;
+        let mut errors = Vec::new();
+        if sources.arch && tokio::time::Instant::now() >= next_download {
             next_download =
                 tokio::time::Instant::now() + Duration::from_secs(options.interval_seconds);
-            Some(feed(&options.feed_file).await.map(std::sync::Arc::new))
-        } else {
-            cached.clone().map(Ok)
-        };
-        let path = options.database.clone();
-        let source = source.clone();
-        let result =
-            tokio::task::spawn_blocking(move || -> Result<Option<std::sync::Arc<Vec<u8>>>> {
+            let downloaded = feed(&options.feed_file).await;
+            let path = options.database.clone();
+            let source = source.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<usize> {
                 let mut db = Database::open(&path)?;
-                let Some(downloaded) = bytes else {
-                    return Ok(None);
-                };
-                if !refresh && !db.has_unassessed_inventory()? {
-                    return Ok(None);
-                }
-                let result =
-                    downloaded.and_then(|bytes| db.assess(&bytes, &source).map(|()| bytes));
+                let result = downloaded.and_then(|bytes| db.import_arch(&bytes, &source));
                 if let Err(error) = &result {
                     db.assessment_failed(&format!("{error:#}"))?;
                 }
-                result.map(Some)
+                result
             })
             .await?;
+            match result {
+                Ok(n) => {
+                    changed = true;
+                    eprintln!("Arch tracker feed imported ({n} advisories)");
+                }
+                // Previously imported advisories stay in use; the failure stays visible
+                // in the assessment status until the next successful download.
+                Err(e) => errors.push(format!("Arch tracker: {e:#}")),
+            }
+        }
+        if sources.osv && tokio::time::Instant::now() >= next_osv {
+            match crate::osv::pass(&options.database, &osv).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    changed = true;
+                    eprintln!("OSV refreshed {n} package queries");
+                }
+                Err(e) => {
+                    next_osv = tokio::time::Instant::now() + OSV_RETRY;
+                    errors.push(format!("OSV: {e:#}"));
+                }
+            }
+        }
+        let path = options.database.clone();
+        let force = changed || options.once;
+        let assessed = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut db = Database::open(&path)?;
+            if !force && !db.has_unassessed_inventory()? {
+                return Ok(false);
+            }
+            db.assess(sources)?;
+            Ok(true)
+        })
+        .await?;
+        match assessed {
+            Ok(true) => eprintln!("Assessment completed"),
+            Ok(false) => {}
+            Err(e) => errors.push(format!("assessment: {e:#}")),
+        }
+        for error in &errors {
+            eprintln!("Assessment source failed: {error}");
+        }
         if options.once {
-            result?;
             if let Some(nvd) = &nvd_once {
                 let n = crate::nvd::pass(&options.database, nvd).await?;
                 eprintln!("NVD enrichment updated {n} CVEs");
             }
+            if !errors.is_empty() {
+                bail!("{}", errors.join("; "));
+            }
             return Ok(());
         }
-        match result {
-            Ok(Some(bytes)) => {
-                cached = Some(bytes);
-                eprintln!(
-                    "Arch assessment completed{}",
-                    if refresh {
-                        ""
-                    } else {
-                        " (new inventory, cached feed)"
-                    }
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Do not let cached re-assessments mark the worker healthy again
-                // until a download succeeds; the failure stays visible in the status.
-                if refresh {
-                    cached = None;
-                }
-                eprintln!("Arch assessment failed: {e:#}");
-            }
+        let mut wake = NEW_INVENTORY_CHECK;
+        if sources.arch {
+            wake = wake.min(next_download.saturating_duration_since(tokio::time::Instant::now()));
         }
-        let wait = next_download.saturating_duration_since(tokio::time::Instant::now());
-        tokio::time::sleep(wait.min(NEW_INVENTORY_CHECK)).await;
+        tokio::time::sleep(wake).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::{Collector, Kind},
+        model::{Inventory, Software},
+        protocol::{Host, Submission},
+    };
+
+    fn host(db: &mut Database, id: &str, os: &str, kind: Kind, items: Vec<(&str, Option<&str>)>) {
+        let c = Collector {
+            id: "os".into(),
+            kind,
+            path: "/usr/bin/true".into(),
+            max_depth: 1,
+        };
+        let mut inventory = Inventory {
+            schema_version: 1,
+            initial_scan_complete: true,
+            ..Inventory::default()
+        };
+        let software = items
+            .into_iter()
+            .map(|(name, source)| {
+                let item = Software::new(&c, name, "1.0-1", "", None, "package database", "");
+                match source {
+                    Some(source) => item.with_source(source, ""),
+                    None => item,
+                }
+            })
+            .collect();
+        inventory.apply(&c, Ok(software), 100, 0.1);
+        db.ingest(&Submission {
+            protocol_version: 1,
+            host: Host {
+                id: id.into(),
+                hostname: id.into(),
+                os: os.into(),
+                os_version: "12".into(),
+                architecture: "x86_64".into(),
+            },
+            sequence: 1,
+            inventory,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn statuses_without_advisory_data() {
+        let mut db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        host(
+            &mut db,
+            "deb",
+            "debian",
+            Kind::Dpkg,
+            vec![("libfoo1", Some("foo")), ("old", None)],
+        );
+        host(&mut db, "arch", "arch", Kind::Pacman, vec![("demo", None)]);
+        host(&mut db, "fedora", "fedora", Kind::Rpm, vec![("demo", None)]);
+        let status = |db: &Database| -> Vec<(String, String)> {
+            db.findings(None, None, 100, 0)
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    (
+                        f["name"].as_str().unwrap().into(),
+                        f["status"].as_str().unwrap().into(),
+                    )
+                })
+                .collect()
+        };
+        db.assess(Sources {
+            arch: true,
+            osv: true,
+        })
+        .unwrap();
+        // No feed imported and no OSV result cached: nothing is reported as clean.
+        let s = status(&db);
+        assert!(s.contains(&("demo".into(), "not_assessed".into())), "{s:?}");
+        assert!(
+            s.contains(&("libfoo1".into(), "not_assessed".into())),
+            "{s:?}"
+        );
+        // A dpkg record without a source package (old agent) and Fedora are not covered.
+        assert!(s.contains(&("old".into(), "unsupported".into())), "{s:?}");
+        assert_eq!(
+            s.iter().filter(|x| x.1 == "unsupported").count(),
+            2,
+            "{s:?}"
+        );
+        db.0.execute(
+            "INSERT INTO osv_queries VALUES ('Debian:12','foo','1.0-1',1,'[]')",
+            [],
+        )
+        .unwrap();
+        db.assess(Sources {
+            arch: false,
+            osv: true,
+        })
+        .unwrap();
+        let s = status(&db);
+        assert!(
+            s.contains(&("libfoo1".into(), "no_known_match".into())),
+            "{s:?}"
+        );
+        assert_eq!(
+            s.iter().filter(|x| x.1 == "unsupported").count(),
+            3,
+            "{s:?}"
+        );
+        assert!(
+            db.assessment_status().unwrap()["success"]
+                .as_bool()
+                .unwrap()
+        );
+    }
     #[test]
     fn arch_versions_and_uncertainty() {
         let mut a = Advisory {

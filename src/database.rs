@@ -39,7 +39,7 @@ impl Database {
         // read the version under the write lock so only one of them migrates.
         let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 3 {
+        if version > 4 {
             bail!("database schema is newer than this server");
         }
         if version == 0 {
@@ -50,6 +50,9 @@ impl Database {
         }
         if version < 3 {
             tx.execute_batch(include_str!("nvd-schema.sql"))?;
+        }
+        if version < 4 {
+            tx.execute_batch(include_str!("osv-schema.sql"))?;
         }
         tx.commit()?;
         Ok(Self(connection))
@@ -118,10 +121,11 @@ impl Database {
                 params![host.id, id],
             )?;
             for item in &state.software {
-                tx.execute("INSERT INTO installations(host_id,collector_id,installation_id,name,version,source,architecture,path,evidence,last_seen)
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                tx.execute("INSERT INTO installations(host_id,collector_id,installation_id,name,version,source,architecture,path,evidence,last_seen,source_package,source_version)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![host.id,id,item.installation_id,item.name,item.version,item.source.name(),
-                        item.architecture,item.path.as_ref().and_then(|p| p.to_str()),item.evidence,state.last_attempt_timestamp_seconds])?;
+                        item.architecture,item.path.as_ref().and_then(|p| p.to_str()),item.evidence,state.last_attempt_timestamp_seconds,
+                        item.source_package,item.source_version])?;
             }
         }
         tx.commit()?;
@@ -157,7 +161,7 @@ impl Database {
     ) -> Result<Vec<Value>> {
         let mut stmt = self.0.prepare(
             "SELECT i.host_id,i.collector_id,i.installation_id,i.name,i.version,i.source,
-            i.architecture,i.path,i.evidence,i.last_seen,c.success,c.active FROM installations i
+            i.architecture,i.path,i.evidence,i.last_seen,c.success,c.active,i.source_package,i.source_version FROM installations i
             JOIN collectors c ON c.host_id=i.host_id AND c.id=i.collector_id
             WHERE (?1 IS NULL OR i.host_id=?1) AND (?2 IS NULL OR i.name=?2)
             ORDER BY i.host_id,i.collector_id,i.installation_id,i.version LIMIT ?3 OFFSET ?4",
@@ -166,7 +170,8 @@ impl Database {
             "host_id":r.get::<_,String>(0)?,"collector_id":r.get::<_,String>(1)?,"installation_id":r.get::<_,String>(2)?,
             "name":r.get::<_,String>(3)?,"version":r.get::<_,Option<String>>(4)?,"source":r.get::<_,String>(5)?,
             "architecture":r.get::<_,String>(6)?,"path":r.get::<_,Option<String>>(7)?,"evidence":r.get::<_,String>(8)?,
-            "last_seen":r.get::<_,i64>(9)?,"collector_success":r.get::<_,bool>(10)?,"collector_active":r.get::<_,bool>(11)?
+            "last_seen":r.get::<_,i64>(9)?,"collector_success":r.get::<_,bool>(10)?,"collector_active":r.get::<_,bool>(11)?,
+            "source_package":r.get::<_,Option<String>>(12)?,"source_version":r.get::<_,Option<String>>(13)?
         })))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -287,6 +292,34 @@ mod tests {
         assert_eq!(db.hosts(100, 0).unwrap().len(), 2);
         assert!(!db.ingest(&first).unwrap());
         assert_eq!(db.hosts(100, 0).unwrap()[0]["last_sequence"], 5);
+    }
+
+    #[test]
+    fn migrates_version_3_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let old = Connection::open(&path).unwrap();
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("assessment-schema.sql"),
+            include_str!("nvd-schema.sql"),
+        ] {
+            old.execute_batch(schema).unwrap();
+        }
+        drop(old);
+        let mut db = Database::open(&path).unwrap();
+        let version: i64 =
+            db.0.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(version, 4);
+        let mut payload = submission(1);
+        let item = &mut payload.inventory.collectors.get_mut("os").unwrap().software[0];
+        item.source_package = Some("demo-src".into());
+        db.ingest(&payload).unwrap();
+        assert_eq!(
+            db.installations(None, None, 10, 0).unwrap()[0]["source_package"],
+            "demo-src"
+        );
     }
 
     #[test]

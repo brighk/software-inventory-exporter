@@ -79,6 +79,8 @@ impl Database {
                         ("name", &name),
                         ("version", &version),
                         ("advisory", &text("advisory_id")),
+                        ("source", &text("source")),
+                        ("advisory_url", &text("advisory_url")),
                         ("severity", &text("severity")),
                         ("cves", &cves.join(",")),
                         ("fixed_version", &fixed),
@@ -178,7 +180,7 @@ impl Database {
         header(
             &mut out,
             "software_inventory_assessment_success",
-            "Whether the latest advisory import and assessment succeeded.",
+            "Whether the latest Arch security tracker import succeeded (1 when disabled).",
         );
         writeln!(
             out,
@@ -188,12 +190,33 @@ impl Database {
         header(
             &mut out,
             "software_inventory_assessment_last_success_timestamp_seconds",
-            "Unix time of the latest successful assessment; zero if never.",
+            "Unix time of the latest successful Arch tracker import; zero if never.",
         );
         writeln!(
             out,
             "software_inventory_assessment_last_success_timestamp_seconds {}",
             state.and_then(|s| s.1).unwrap_or(0)
+        )?;
+        let osv = self.osv_state()?;
+        header(
+            &mut out,
+            "software_inventory_osv_success",
+            "Whether the latest OSV.dev query pass succeeded.",
+        );
+        writeln!(
+            out,
+            "software_inventory_osv_success {}",
+            u8::from(osv.is_some_and(|s| s.0))
+        )?;
+        header(
+            &mut out,
+            "software_inventory_osv_last_success_timestamp_seconds",
+            "Unix time of the latest successful OSV.dev query pass; zero if never.",
+        );
+        writeln!(
+            out,
+            "software_inventory_osv_last_success_timestamp_seconds {}",
+            osv.and_then(|s| s.1).unwrap_or(0)
         )?;
         let nvd = self.nvd_state()?;
         header(

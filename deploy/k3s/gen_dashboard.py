@@ -47,17 +47,18 @@ panels = [
     stat(2, "Installed packages", f'count(software_inventory_package_info{{{SEL}}})', 4),
     stat(3, "Patch available", f'count(software_inventory_vulnerability_info{{{SEL},patch_available="true"}}) or vector(0)', 8,
          thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}],
-         desc="Findings where the Arch tracker lists a fixed version newer than the installed one: update (pacman -Syu)."),
+         desc="Findings where the advisory lists a fixed version: update the package (pacman -Syu, apt upgrade, dnf upgrade, pip/npm/cargo)."),
     stat(4, "Open advisories, no fix", f'count(software_inventory_vulnerability_info{{{SEL},patch_available="false"}}) or vector(0)', 12,
          thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}],
-         desc="Tracker marks the package vulnerable but has no fixed version. Often stale tracker entries; review."),
+         desc="Advisories without a fixed version. Arch entries are often stale; Debian/Ubuntu list unfixed and minor issues. Review."),
     stat(5, "Oldest host report", f'time() - min(software_inventory_host_last_seen_timestamp_seconds{{{SEL}}})', 16, unit="s",
          thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 13 * 3600}, {"color": "red", "value": 25 * 3600}],
          desc="Agents report every 12h. Orange after 13h, red after a missed cycle."),
-    stat(6, "CVE feed", 'software_inventory_assessment_success', 20,
+    stat(6, "Advisory feeds", 'min(software_inventory_assessment_success) * min(software_inventory_osv_success)', 20,
          thresholds=[{"color": "red", "value": None}, {"color": "green", "value": 1}],
          mapping=[{"type": "value", "options": {"0": {"text": "FAILED"}, "1": {"text": "OK"}}}],
-         desc="Whether the latest Arch security tracker import and assessment succeeded."),
+         desc="Whether the latest Arch security tracker import and OSV.dev query pass both succeeded "
+              "(see /v1/assessment-status for the failing one)."),
     stat(9, "CVSS ≥ 7", f'count(software_inventory_vulnerability_cvss_score{{{SEL}}} >= 7) or vector(0)', 24,
          thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}],
          desc="Findings whose highest NVD CVSS base score is High (7.0) or Critical (9.0+)."),
@@ -67,7 +68,8 @@ panels = [
          desc="Whether the latest NIST NVD CVSS enrichment pass completed. New CVEs are looked up "
               "every 10 minutes (about 6 s per CVE without an API key) and refreshed weekly."),
 ]
-sev = color_map("Severity", {"Critical": "dark-red", "High": "red", "Medium": "orange", "Low": "yellow", "Unknown": "text"})
+sev = color_map("Severity", {"Critical": "dark-red", "High": "red", "Medium": "orange", "Moderate": "orange",
+                             "Low": "yellow", "Negligible": "text", "Unimportant": "text", "Unknown": "text"})
 patch = color_map("Patch available", {"true": "red", "false": "orange"})
 cvss_sev = color_map("CVSS severity", {"CRITICAL": "dark-red", "HIGH": "red", "MEDIUM": "orange", "LOW": "yellow"})
 cvss = {"matcher": {"id": "byName", "options": "CVSS"}, "properties": [
@@ -79,28 +81,33 @@ cvss = {"matcher": {"id": "byName", "options": "CVSS"}, "properties": [
 cve_link = {"matcher": {"id": "byName", "options": "Scored CVE"}, "properties": [{"id": "links", "value": [
     {"title": "NVD", "url": "https://nvd.nist.gov/vuln/detail/${__value.raw}", "targetBlank": True}]}]}
 link = {"matcher": {"id": "byName", "options": "Advisory"}, "properties": [{"id": "links", "value": [
-    {"title": "Arch security tracker", "url": "https://security.archlinux.org/${__value.raw}", "targetBlank": True}]}]}
+    {"title": "Open advisory", "url": "${__data.fields[\"advisory_url\"]}", "targetBlank": True}]}]}
+# Kept in the frame for the advisory link, but not shown.
+url_hidden = {"matcher": {"id": "byName", "options": "advisory_url"}, "properties": [{"id": "custom.hidden", "value": True}]}
 panels.append(table(7, "Software that needs a patch",
     f'software_inventory_vulnerability_info{{{SEL}}}', 4, 12,
     {"hostname": "Host", "name": "Package", "version": "Installed", "fixed_version": "Fixed in",
-     "patch_available": "Patch available", "severity": "Arch severity", "advisory": "Advisory", "cves": "CVEs",
+     "patch_available": "Patch available", "severity": "Severity", "advisory": "Advisory", "cves": "CVEs", "source": "Source",
      "finding_status": "Match", "tracker_status": "Tracker status", "cvss_score": "CVSS",
      "cvss_severity": "CVSS severity", "cvss_version": "CVSS ver.", "cvss_cve": "Scored CVE"},
     {"hostname": 0, "name": 1, "version": 2, "cvss_score": 3, "cvss_severity": 4, "fixed_version": 5,
      "patch_available": 6, "severity": 7, "advisory": 8, "cves": 9, "cvss_cve": 10, "cvss_version": 11,
-     "finding_status": 12, "tracker_status": 13},
-    "Packages matching an Arch security advisory. CVSS = highest NIST NVD base score among the advisory's CVEs "
-    "(empty until looked up, or when NVD has not scored it). 'Patch available' = the tracker lists a fixed version: "
-    "upgrade. Match 'affected' = exact affected version; 'needs_review' = possible match. Click an advisory or CVE.",
-    [sev, cvss_sev, patch, link, cvss, cve_link], [{"displayName": "CVSS", "desc": True}]))
+     "finding_status": 12, "source": 13, "tracker_status": 14, "advisory_url": 15},
+    "Packages matching an advisory: Arch security tracker (pacman) or OSV.dev (Debian, Ubuntu, RPM distributions, "
+    "PyPI, npm, crates.io). CVSS = highest NIST NVD base score among the advisory's CVEs "
+    "(empty until looked up, or when NVD has not scored it). 'Patch available' = the advisory lists a fixed version: "
+    "upgrade. Match 'affected' = installed version is affected; 'needs_review' = possible Arch match. "
+    "Click an advisory or CVE.",
+    [sev, cvss_sev, patch, link, url_hidden, cvss, cve_link], [{"displayName": "CVSS", "desc": True}]))
 status = color_map("Status", {"affected": "red", "needs_review": "orange", "no_known_match": "green",
                               "pending": "blue", "not_assessed": "text", "stale_inventory": "purple", "unsupported": "text"})
 panels.append(table(8, "All software",
     f'software_inventory_package_info{{{SEL},name=~"(?i).*$search.*"}}', 16, 16,
     {"hostname": "Host", "name": "Package", "version": "Version", "status": "Status", "collector": "Collector"},
     {"hostname": 0, "name": 1, "version": 2, "status": 3, "collector": 4},
-    "Every installed package reported by agents (pacman, including dependencies). Status is the assessment against the "
-    "Arch security tracker; 'no_known_match' is not proof of safety; 'pending' clears after the next hourly assessment.",
+    "Every installed package reported by agents. Status is the assessment against the Arch security tracker or "
+    "OSV.dev; 'unsupported' = no advisory source for this distribution or collector; 'no_known_match' is not "
+    "proof of safety; 'pending' clears within a minute or two.",
     [status], [{"displayName": "Package", "desc": False}]))
 
 dashboard = {

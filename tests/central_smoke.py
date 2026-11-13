@@ -1,4 +1,4 @@
-"""Mac/Linux integration test: central API, durable agent, Arch assessment fixtures."""
+"""Mac/Linux integration test: central API, durable agent, Arch and OSV assessment fixtures."""
 import json
 import os
 import pathlib
@@ -44,6 +44,45 @@ class FakeNvd(BaseHTTPRequestHandler):
         pass
 
 
+# Fake OSV.dev API: querybatch and vulnerability records.
+osv = {'batches': [], 'vulns': []}
+OSV_RECORD = {'id': 'DEBIAN-CVE-2023-5363', 'modified': '2026-01-01T00:00:00Z', 'upstream': ['CVE-2023-5363'],
+              'affected': [{'package': {'name': 'openssl', 'ecosystem': 'Debian:12'},
+                            'ecosystem_specific': {'urgency': 'high'},
+                            'ranges': [{'type': 'ECOSYSTEM', 'events': [{'introduced': '0'}, {'fixed': '3.0.11-1~deb12u2'}]}]}]}
+
+
+class FakeOsv(BaseHTTPRequestHandler):
+    def reply(self, body, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def do_POST(self):
+        queries = json.loads(self.rfile.read(int(self.headers['Content-Length'])))['queries']
+        osv['batches'].append(queries)
+        results = []
+        for q in queries:
+            hit = (q['package'], q['version']) == ({'ecosystem': 'Debian:12', 'name': 'openssl'}, '3.0.11-1~deb12u1')
+            results.append({'vulns': [{'id': OSV_RECORD['id'], 'modified': OSV_RECORD['modified']}]} if hit else {})
+        self.reply({'results': results})
+
+    def do_GET(self):
+        osv['vulns'].append(self.path)
+        if self.path == '/v1/vulns/' + OSV_RECORD['id']:
+            self.reply(OSV_RECORD)
+        else:
+            self.reply({}, 404)
+
+    def log_message(self, *args):
+        pass
+
+
+osv_server = ThreadingHTTPServer(('127.0.0.1', 0), FakeOsv)
+threading.Thread(target=osv_server.serve_forever, daemon=True).start()
+osv_url = f'http://127.0.0.1:{osv_server.server_address[1]}'
+
 nvd_server = ThreadingHTTPServer(('127.0.0.1', 0), FakeNvd)
 threading.Thread(target=nvd_server.serve_forever, daemon=True).start()
 nvd_url = f'http://127.0.0.1:{nvd_server.server_address[1]}/rest/json/cves/2.0'
@@ -55,7 +94,7 @@ with tempfile.TemporaryDirectory() as directory:
     upload_token = 'u' * 40
     read_token = 'r' * 40
     credentials = root / 'credentials.json'
-    credentials.write_text(json.dumps({'read_token': read_token, 'hosts': {'arch-test': upload_token}}))
+    credentials.write_text(json.dumps({'read_token': read_token, 'hosts': {'arch-test': upload_token, 'deb-test': 'd' * 40}}))
     database = root / 'inventory.db'
     fake_pacman = root / 'pacman'
     fake_pacman.write_text("#!/bin/sh\nprintf 'demo 1-1\\n'\n")
@@ -198,11 +237,45 @@ with tempfile.TemporaryDirectory() as directory:
             invalid['inventory']['schema_version'] = 99
             expect_status(400, '/v1/inventory', upload_token, invalid)
             assert request('/v1/hosts')['hosts'][0]['last_sequence'] == 5
+
+            # Debian host: dpkg source packages are matched through OSV.
+            fake_dpkg = root / 'dpkg-query'
+            fake_dpkg.write_text("#!/bin/sh\nprintf 'libssl3:amd64\\t3.0.11-1~deb12u1\\tamd64\\tinstalled\\topenssl\\t3.0.11-1~deb12u1\\n"
+                                 "curl\\t7.88.1-10\\tamd64\\tinstalled\\tcurl\\t7.88.1-10\\n'\n")
+            fake_dpkg.chmod(0o755)
+            deb_config = root / 'deb.toml'
+            deb_config.write_text('[[collectors]]\nid="os"\nkind="dpkg"\npath=' + json.dumps(str(fake_dpkg)) + '\n')
+            result = subprocess.run([binary, '--config', str(deb_config), 'agent', '--server', origin, '--host-id', 'deb-test',
+                                     '--hostname', 'bookworm', '--os', 'debian', '--os-version', '12',
+                                     '--state', str(root / 'deb-state.json'), '--once'],
+                                    env=dict(os.environ, INVENTORY_TOKEN='d' * 40), capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, result.stderr
+            libssl = request('/v1/installations?host_id=deb-test&name=libssl3:amd64')['installations'][0]
+            assert libssl['source_package'] == 'openssl' and libssl['source_version'] is None, libssl
+            osv_assess = [binary, 'assess', '--database', str(database), '--no-arch', '--no-nvd', '--osv-url', osv_url, '--once']
+            result = subprocess.run(osv_assess, capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, result.stderr
+            assert len(osv['batches']) == 1 and len(osv['batches'][0]) == 2, osv['batches']
+            assert osv['vulns'] == ['/v1/vulns/DEBIAN-CVE-2023-5363'], osv['vulns']
+            rows = {r['name']: r for r in request('/v1/findings?host_id=deb-test')['assessments']}
+            assert rows['curl']['status'] == 'no_known_match', rows
+            assert rows['libssl3:amd64']['status'] == 'affected', rows
+            finding = rows['libssl3:amd64']['findings'][0]
+            assert (finding['source'], finding['advisory_id'], finding['fixed_version'], finding['severity'], finding['cves']) == \
+                ('osv', 'DEBIAN-CVE-2023-5363', '3.0.11-1~deb12u2', 'High', ['CVE-2023-5363']), finding
+            with urllib.request.urlopen(req, timeout=3) as response:
+                metrics = response.read().decode()
+            assert 'advisory="DEBIAN-CVE-2023-5363",source="osv",advisory_url="https://osv.dev/vulnerability/DEBIAN-CVE-2023-5363"' in metrics, metrics
+            assert 'software_inventory_osv_success 1' in metrics, metrics
+            assert request('/v1/assessment-status')['osv']['success']
+            # Cached: no new OSV requests until the refresh interval passes.
+            subprocess.run(osv_assess, check=True, capture_output=True, timeout=10)
+            assert len(osv['batches']) == 1 and len(osv['vulns']) == 1
         finally:
             server.terminate()
             server.wait(timeout=5)
     with sqlite3.connect(database) as db:
-        assert db.execute('SELECT COUNT(*) FROM hosts').fetchone()[0] == 1
-        assert db.execute('SELECT COUNT(*) FROM scans').fetchone()[0] == 5
+        assert db.execute('SELECT COUNT(*) FROM hosts').fetchone()[0] == 2
+        assert db.execute('SELECT COUNT(*) FROM scans').fetchone()[0] == 6
     assert json.loads(state.read_text())['pending'] is None
-print('Central API, durable submission, and Arch assessment smoke tests passed')
+print('Central API, durable submission, Arch and OSV assessment smoke tests passed')

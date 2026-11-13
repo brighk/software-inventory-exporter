@@ -7,6 +7,7 @@ services on each host: an agent in a container would inventory the container, no
 host (systemd)                       namespace software-inventory
 software-inventory-agent  --push-->  pod: server ── SQLite (PVC) ── assess
   every 12 h                              │                         ├ Arch tracker, hourly
+                                          │                         ├ OSV.dev, every 6 h
                                           │                         └ NIST NVD CVSS
                                           └─ /metrics ── ServiceMonitor ──> Prometheus ──> Grafana
 ```
@@ -45,8 +46,8 @@ The image is `ghcr.io/brighk/software-inventory-exporter`, built for amd64 and a
 To run your own build without a registry on k3s:
 
 ```sh
-docker build -t ghcr.io/brighk/software-inventory-exporter:0.1.0 .
-docker save ghcr.io/brighk/software-inventory-exporter:0.1.0 | sudo k3s ctr images import -
+docker build -t ghcr.io/brighk/software-inventory-exporter:0.2.0 .
+docker save ghcr.io/brighk/software-inventory-exporter:0.2.0 | sudo k3s ctr images import -
 ```
 
 ### Optional: NVD API key
@@ -91,9 +92,10 @@ curl -s -H "Authorization: Bearer $READ" 'http://127.0.0.1:9899/v1/findings?stat
 In Prometheus, the target `serviceMonitor/software-inventory/software-inventory/0` should
 be up. The Grafana dashboard is **Software Inventory** (UID `software-inventory`).
 
-If `security.archlinux.org` or NVD is unreachable, the worker keeps its last results,
-turns the corresponding dashboard stat red, and retries (tracker hourly, NVD every 10
-minutes).
+The assess container needs outbound HTTPS to `security.archlinux.org`, `api.osv.dev`
+and `services.nvd.nist.gov`. If one is unreachable, the worker keeps its last results,
+turns the corresponding dashboard stat red, and retries (tracker hourly, OSV and NVD
+every 10 minutes).
 
 ## Upgrade
 

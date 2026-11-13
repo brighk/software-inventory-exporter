@@ -19,12 +19,12 @@ pub async fn collect(c: &Collector, config: &Config) -> Result<Vec<Software>> {
         let args: &[&str] = match c.kind {
             Kind::Dpkg => &[
                 "-W",
-                "-f=${binary:Package}\t${Version}\t${Architecture}\t${db:Status-Status}\n",
+                "-f=${binary:Package}\t${Version}\t${Architecture}\t${db:Status-Status}\t${source:Package}\t${source:Version}\n",
             ],
             Kind::Rpm => &[
                 "-qa",
                 "--qf",
-                "%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{ARCH}\n",
+                "%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\n",
             ],
             Kind::Pacman => &["-Q"],
             Kind::Snap => &["list"],
@@ -70,7 +70,7 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
         let item = match c.kind {
             Kind::Dpkg => {
                 let fields: Vec<_> = line.split('\t').collect();
-                if fields.len() != 4 {
+                if fields.len() != 6 {
                     bail!("invalid dpkg record at line {}", line_number + 1);
                 }
                 if fields[3] != "installed" {
@@ -85,10 +85,11 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
                     "package database",
                     "",
                 )
+                .with_source(fields[4], fields[5])
             }
             Kind::Rpm => {
                 let fields: Vec<_> = line.split('\t').collect();
-                if fields.len() != 3 {
+                if fields.len() != 4 {
                     bail!("invalid rpm record");
                 }
                 Software::new(
@@ -100,6 +101,7 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
                     "package database",
                     "",
                 )
+                .with_source(source_rpm_name(fields[3]).unwrap_or(""), "")
             }
             Kind::Pacman => {
                 let fields: Vec<_> = line.split_whitespace().collect();
@@ -160,6 +162,16 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
 
 // O_NONBLOCK prevents a metadata path replaced by a FIFO from hanging open().
 // Read limits and regular-file checks apply even to symlink targets.
+/// Name part of a source RPM file name such as `openssl-3-3.0.8-150500.5.8.1.src.rpm`.
+fn source_rpm_name(file: &str) -> Option<&str> {
+    let stem = file
+        .strip_suffix(".src.rpm")
+        .or_else(|| file.strip_suffix(".nosrc.rpm"))?;
+    let (rest, _release) = stem.rsplit_once('-')?;
+    let (name, _version) = rest.rsplit_once('-')?;
+    (!name.is_empty()).then_some(name)
+}
+
 fn read_file(path: &Path, limit: usize) -> Result<String> {
     let file = File::options()
         .read(true)
@@ -265,7 +277,7 @@ fn parse_cargo(c: &Collector, text: &str) -> Result<Vec<Software>> {
                 version,
                 "",
                 Some(c.path.clone()),
-                "Cargo .crates.toml; binary present",
+                &format!("Cargo .crates.toml {origin}; binary present"),
                 origin,
             ));
         }
@@ -427,21 +439,33 @@ mod tests {
         let c = c(Kind::Dpkg, Path::new("/usr/bin/dpkg-query"));
         let items = parse_command(
             &c,
-            "lib:amd64\t1:2.3-4\tamd64\tinstalled\nold\t1\tall\tconfig-files\n",
+            "libssl3:amd64\t3.0.11-1~deb12u2+b1\tamd64\tinstalled\topenssl\t3.0.11-1~deb12u2\n\
+             old\t1\tall\tconfig-files\told\t1\n\
+             curl\t7.88.1-10\tamd64\tinstalled\tcurl\t7.88.1-10\n",
         )
         .unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].version.as_deref(), Some("1:2.3-4"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].version.as_deref(), Some("3.0.11-1~deb12u2+b1"));
+        assert_eq!(items[0].source_package.as_deref(), Some("openssl"));
+        assert_eq!(items[0].source_version.as_deref(), Some("3.0.11-1~deb12u2"));
+        // The source version is only kept when it differs from the binary version.
+        assert_eq!(items[1].source_package.as_deref(), Some("curl"));
+        assert_eq!(items[1].source_version, None);
         assert!(parse_command(&c, "broken").is_err());
     }
     #[test]
     fn parses_package_formats() {
         let root = Path::new("/tmp");
-        assert_eq!(
-            parse_command(&c(Kind::Rpm, root), "kernel\t0:6.1-2\tx86_64\n").unwrap()[0]
-                .architecture,
-            "x86_64"
-        );
+        let rpm = parse_command(
+            &c(Kind::Rpm, root),
+            "libopenssl3\t0:3.0.8-150500.5.8.1\tx86_64\topenssl-3-3.0.8-150500.5.8.1.src.rpm\n\
+             gpg-pubkey\t0:1-2\t(none)\t(none)\n",
+        )
+        .unwrap();
+        assert_eq!(rpm[0].architecture, "x86_64");
+        assert_eq!(rpm[0].source_package.as_deref(), Some("openssl-3"));
+        assert_eq!(rpm[1].source_package, None);
+        assert!(parse_command(&c(Kind::Rpm, root), "kernel\t0:6.1-2\tx86_64\n").is_err());
         assert_eq!(
             parse_command(&c(Kind::Pacman, root), "linux 6.1-1\n")
                 .unwrap()
