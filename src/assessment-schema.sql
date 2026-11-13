@@ -1,4 +1,3 @@
-BEGIN IMMEDIATE;
 CREATE TABLE advisories (
     id TEXT PRIMARY KEY, source TEXT NOT NULL, data TEXT NOT NULL
 );
@@ -15,4 +14,3 @@ CREATE TABLE assessments (
     PRIMARY KEY(host_id,collector_id,installation_id,version)
 );
 PRAGMA user_version=2;
-COMMIT;

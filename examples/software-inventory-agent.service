@@ -1,0 +1,43 @@
+[Unit]
+Description=Software inventory agent (pushes to the central inventory server)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Runs on EVERY host, including the central one, as a transient unprivileged user.
+# pacman -Q only needs read access to /var/lib/pacman, which any user has.
+DynamicUser=yes
+# Contains INVENTORY_TOKEN=<this host's upload token>; chmod 600, owned by root.
+EnvironmentFile=/etc/software-inventory-exporter/agent.env
+# Replace HOST_ID with this host's provisioned, stable ID. Hostname and OS are
+# detected from the kernel and /etc/os-release; override with --hostname/--os.
+ExecStart=/usr/local/bin/software-inventory-exporter \
+    --config /etc/software-inventory-exporter/agent.toml agent \
+    --server https://inventory.example.internal \
+    --host-id HOST_ID \
+    --state /var/lib/software-inventory-agent/state.json
+# Holds the sequence counter and pending snapshot. Never copy it to another host.
+StateDirectory=software-inventory-agent
+StateDirectoryMode=0700
+# 4xx responses (bad token, sequence conflict) exit nonzero and need an operator;
+# the delay keeps a misconfigured agent from hammering the server.
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

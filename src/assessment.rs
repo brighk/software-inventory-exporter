@@ -14,6 +14,11 @@ use std::{
     time::Duration,
 };
 
+/// Effective assessment status of an installation row `i` joined with host `h`,
+/// collector `c` and (left-joined) assessment `a`. Shared by the API and metrics.
+pub const EFFECTIVE_STATUS: &str = "CASE WHEN c.success=0 OR c.active=0 THEN 'stale_inventory'
+    WHEN a.sequence IS NOT NULL AND a.sequence<>h.last_sequence THEN 'pending'
+    ELSE COALESCE(a.status,'not_assessed') END";
 const FEED_URL: &str = "https://security.archlinux.org/issues/all.json";
 const MAX_FEED: usize = 32 * 1024 * 1024;
 #[derive(Args)]
@@ -27,6 +32,15 @@ pub struct Options {
     interval_seconds: u64,
     #[arg(long)]
     once: bool,
+    /// Disable CVSS enrichment from the NIST NVD API.
+    #[arg(long)]
+    no_nvd: bool,
+    /// NVD CVE API 2.0 endpoint. An optional API key is read from NVD_API_KEY.
+    #[arg(long, default_value = crate::nvd::DEFAULT_URL)]
+    nvd_url: String,
+    /// Re-fetch cached NVD records older than this.
+    #[arg(long, default_value_t = 7 * 86400)]
+    nvd_refresh_seconds: u64,
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Advisory {
@@ -172,28 +186,43 @@ impl Database {
             "error":r.get::<_,Option<String>>(3)?,"feed_sha256":r.get::<_,Option<String>>(4)?,"feed_source":r.get::<_,Option<String>>(5)?
         }))).optional()?.unwrap_or(json!({"success":false,"last_success":null,"error":"not assessed"})))
     }
-    pub fn findings(&self, host: Option<&str>, limit: i64, offset: i64) -> Result<Vec<Value>> {
-        let mut stmt = self.0.prepare("SELECT i.host_id,i.collector_id,i.installation_id,i.name,i.version,a.status,a.findings,a.assessed_at,
-            a.sequence,h.last_sequence,c.success,c.active,h.last_seen
+    pub fn findings(
+        &self,
+        host: Option<&str>,
+        statuses: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Value>> {
+        let mut stmt = self.0.prepare(&format!("SELECT i.host_id,i.collector_id,i.installation_id,i.name,i.version,a.status,a.findings,a.assessed_at,
+            a.sequence,h.last_sequence,c.success,c.active,h.last_seen,
+            {EFFECTIVE_STATUS} AS effective
             FROM installations i JOIN hosts h ON h.id=i.host_id JOIN collectors c ON c.host_id=i.host_id AND c.id=i.collector_id
             LEFT JOIN assessments a ON a.host_id=i.host_id AND a.collector_id=i.collector_id AND a.installation_id=i.installation_id AND a.version=COALESCE(i.version,'')
-            WHERE (?1 IS NULL OR i.host_id=?1) ORDER BY i.host_id,i.collector_id,i.installation_id,i.version LIMIT ?2 OFFSET ?3")?;
-        let rows = stmt.query_map(params![host,limit,offset], |r| {
-            let assessed_sequence: Option<i64> = r.get(8)?;
-            let current_sequence: i64 = r.get(9)?;
-            let success: bool = r.get(10)?; let active: bool = r.get(11)?;
-            let stored_status: Option<String> = r.get(5)?;
-            let status = if !success || !active { "stale_inventory" }
-                else if assessed_sequence.is_some_and(|s| s != current_sequence) { "pending" }
-                else { stored_status.as_deref().unwrap_or("not_assessed") };
+            WHERE (?1 IS NULL OR i.host_id=?1) AND (?4 IS NULL OR instr(','||?4||',', ','||effective||',')>0)
+            ORDER BY i.host_id,i.collector_id,i.installation_id,i.version LIMIT ?2 OFFSET ?3"))?;
+        let scores = self.cvss_scores()?;
+        let rows = stmt.query_map(params![host,limit,offset,statuses], |r| {
+            // Effective status is computed in SQL so filtering and pagination agree.
+            let status: String = r.get(13)?;
             let findings: Option<String> = r.get(6)?;
             Ok(json!({"host_id":r.get::<_,String>(0)?,"collector_id":r.get::<_,String>(1)?,
                 "installation_id":r.get::<_,String>(2)?,"name":r.get::<_,String>(3)?,"version":r.get::<_,Option<String>>(4)?,
-                "status":status,"findings":findings.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!([])),
+                "status":status,"findings":with_cvss(findings.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!([])), &scores),
                 "assessed_at":r.get::<_,Option<i64>>(7)?,"host_last_seen":r.get::<_,i64>(12)?}))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+}
+
+/// Adds the highest cached NVD CVSS score of each finding's CVEs as `cvss` (or null).
+fn with_cvss(mut findings: Value, scores: &HashMap<String, crate::nvd::Cvss>) -> Value {
+    if let Some(items) = findings.as_array_mut() {
+        for finding in items {
+            let cvss = crate::nvd::to_json(crate::nvd::best(&finding["cves"], scores));
+            finding["cvss"] = cvss;
+        }
+    }
+    findings
 }
 
 async fn feed(file: &Option<PathBuf>) -> Result<Vec<u8>> {
@@ -228,35 +257,111 @@ async fn feed(file: &Option<PathBuf>) -> Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+/// How often the worker checks for inventory that arrived since the last assessment.
+const NEW_INVENTORY_CHECK: Duration = Duration::from_secs(60);
+
+impl Database {
+    /// True when some current installation has no assessment for its host's latest sequence.
+    fn has_unassessed_inventory(&self) -> Result<bool> {
+        Ok(self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM installations i JOIN hosts h ON h.id=i.host_id
+             LEFT JOIN assessments a ON a.host_id=i.host_id AND a.collector_id=i.collector_id
+                AND a.installation_id=i.installation_id AND a.version=COALESCE(i.version,'')
+             WHERE a.sequence IS NULL OR a.sequence<>h.last_sequence)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+}
+
 pub async fn run(options: Options) -> Result<()> {
     if options.interval_seconds == 0 {
         bail!("interval must be positive");
     }
-    loop {
-        let downloaded = feed(&options.feed_file).await;
-        let path = options.database.clone();
-        let source = options
-            .feed_file
-            .as_ref()
-            .map(|p| format!("file:{}", p.display()))
-            .unwrap_or(FEED_URL.into());
-        let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut db = Database::open(&path)?;
-            let result = downloaded.and_then(|bytes| db.assess(&bytes, &source));
-            if let Err(error) = &result {
-                db.assessment_failed(&format!("{error:#}"))?;
-            }
-            result
-        })
-        .await?;
+    let nvd = (!options.no_nvd).then(|| crate::nvd::Options {
+        url: options.nvd_url.clone(),
+        api_key: std::env::var("NVD_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty()),
+        refresh_seconds: options.nvd_refresh_seconds,
+    });
+    let mut nvd_once = None;
+    if let Some(nvd) = nvd {
         if options.once {
-            return result;
+            nvd_once = Some(nvd);
+        } else {
+            // Independent, rate-limited loop; reads findings the assessment writes.
+            tokio::spawn(crate::nvd::run(options.database.clone(), nvd));
+        }
+    }
+    let source = options
+        .feed_file
+        .as_ref()
+        .map(|p| format!("file:{}", p.display()))
+        .unwrap_or(FEED_URL.into());
+    // Last successfully assessed feed, reused to assess new inventory between downloads.
+    let mut cached: Option<std::sync::Arc<Vec<u8>>> = None;
+    let mut next_download = tokio::time::Instant::now();
+    loop {
+        let refresh = tokio::time::Instant::now() >= next_download;
+        let bytes = if refresh {
+            next_download =
+                tokio::time::Instant::now() + Duration::from_secs(options.interval_seconds);
+            Some(feed(&options.feed_file).await.map(std::sync::Arc::new))
+        } else {
+            cached.clone().map(Ok)
+        };
+        let path = options.database.clone();
+        let source = source.clone();
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<Option<std::sync::Arc<Vec<u8>>>> {
+                let mut db = Database::open(&path)?;
+                let Some(downloaded) = bytes else {
+                    return Ok(None);
+                };
+                if !refresh && !db.has_unassessed_inventory()? {
+                    return Ok(None);
+                }
+                let result =
+                    downloaded.and_then(|bytes| db.assess(&bytes, &source).map(|()| bytes));
+                if let Err(error) = &result {
+                    db.assessment_failed(&format!("{error:#}"))?;
+                }
+                result.map(Some)
+            })
+            .await?;
+        if options.once {
+            result?;
+            if let Some(nvd) = &nvd_once {
+                let n = crate::nvd::pass(&options.database, nvd).await?;
+                eprintln!("NVD enrichment updated {n} CVEs");
+            }
+            return Ok(());
         }
         match result {
-            Ok(()) => eprintln!("Arch assessment completed"),
-            Err(e) => eprintln!("Arch assessment failed: {e:#}"),
+            Ok(Some(bytes)) => {
+                cached = Some(bytes);
+                eprintln!(
+                    "Arch assessment completed{}",
+                    if refresh {
+                        ""
+                    } else {
+                        " (new inventory, cached feed)"
+                    }
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Do not let cached re-assessments mark the worker healthy again
+                // until a download succeeds; the failure stays visible in the status.
+                if refresh {
+                    cached = None;
+                }
+                eprintln!("Arch assessment failed: {e:#}");
+            }
         }
-        tokio::time::sleep(Duration::from_secs(options.interval_seconds)).await;
+        let wait = next_download.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(wait.min(NEW_INVENTORY_CHECK)).await;
     }
 }
 

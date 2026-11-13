@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Software inventory agent, central database, Arch advisory assessment and Prometheus exporter"
+rust-version = "1.95"
+repository = "https://github.com/brighk/software-inventory-exporter"
+readme = "README.md"
+keywords = ["inventory", "vulnerability", "prometheus", "archlinux", "cvss"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

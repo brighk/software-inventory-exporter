@@ -19,17 +19,39 @@ impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 2 {
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // Switching a new file to WAL can return SQLITE_BUSY without invoking the busy
+        // handler when another process opens it at the same moment; retry briefly.
+        let started = std::time::Instant::now();
+        loop {
+            match connection.execute_batch("PRAGMA journal_mode=WAL;") {
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && started.elapsed() < Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => break result?,
+            }
+        }
+        let mut connection = connection;
+        // The server and assessment worker may open a new database concurrently:
+        // read the version under the write lock so only one of them migrates.
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > 3 {
             bail!("database schema is newer than this server");
         }
         if version == 0 {
-            connection.execute_batch(include_str!("schema.sql"))?;
+            tx.execute_batch(include_str!("schema.sql"))?;
         }
         if version < 2 {
-            connection.execute_batch(include_str!("assessment-schema.sql"))?;
+            tx.execute_batch(include_str!("assessment-schema.sql"))?;
         }
+        if version < 3 {
+            tx.execute_batch(include_str!("nvd-schema.sql"))?;
+        }
+        tx.commit()?;
         Ok(Self(connection))
     }
 
@@ -104,6 +126,16 @@ impl Database {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Deletes scan summaries received before `cutoff`, keeping each host's latest
+    /// scan: its digest lets an agent that missed the acknowledgment retry safely.
+    pub fn prune_scans(&self, cutoff: i64) -> Result<usize> {
+        Ok(self.0.execute(
+            "DELETE FROM scans WHERE received_at < ?1
+             AND sequence < (SELECT last_sequence FROM hosts WHERE hosts.id = scans.host_id)",
+            [cutoff],
+        )?)
     }
 
     pub fn hosts(&self, limit: i64, offset: i64) -> Result<Vec<Value>> {
@@ -255,6 +287,25 @@ mod tests {
         assert_eq!(db.hosts(100, 0).unwrap().len(), 2);
         assert!(!db.ingest(&first).unwrap());
         assert_eq!(db.hosts(100, 0).unwrap()[0]["last_sequence"], 5);
+    }
+
+    #[test]
+    fn prunes_old_scans_but_keeps_latest_for_retries() {
+        let mut db = Database::open(Path::new(":memory:")).unwrap();
+        for sequence in 1..=3 {
+            assert!(db.ingest(&submission(sequence)).unwrap());
+        }
+        let count = |db: &Database| -> i64 {
+            db.0.query_row("SELECT COUNT(*) FROM scans", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(db.prune_scans(0).unwrap(), 0);
+        assert_eq!(db.prune_scans(i64::MAX).unwrap(), 2);
+        assert_eq!(count(&db), 1);
+        // The lost-acknowledgment retry of the latest scan is still a duplicate, not a conflict.
+        assert!(!db.ingest(&submission(3)).unwrap());
+        assert!(db.ingest(&submission(2)).is_err());
+        assert!(db.ingest(&submission(4)).unwrap());
     }
 
     #[test]

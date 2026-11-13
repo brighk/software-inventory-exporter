@@ -1,0 +1,7 @@
+# Used by the release workflow: packages binaries already built natively per architecture
+# (image/<amd64|arm64>/software-inventory-exporter). For local builds use Dockerfile.
+FROM alpine:3.22
+ARG TARGETARCH
+COPY image/${TARGETARCH}/software-inventory-exporter /usr/local/bin/software-inventory-exporter
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/software-inventory-exporter"]

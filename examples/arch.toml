@@ -1,5 +1,6 @@
 # Real Arch agent configuration. Includes explicitly installed packages and dependencies.
-interval_seconds = 900
+# Scan and upload every 12 hours. Failed uploads retry within 5 minutes.
+interval_seconds = 43200
 timeout_seconds = 30
 
 [[collectors]]

@@ -1,0 +1,137 @@
+# Central inventory server + Arch assessment worker for k3s.
+# Secrets are NOT in this file; see deploy/k3s/README.md for creating them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: software-inventory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: inventory-db
+  namespace: software-inventory
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: software-inventory
+  namespace: software-inventory
+  labels: {app.kubernetes.io/name: software-inventory}
+spec:
+  replicas: 1
+  # SQLite on a ReadWriteOnce volume: never run two pods at once.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: software-inventory}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: software-inventory}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # local-path volumes are created root-owned on the node; make the DB dir ours.
+        - name: data-permissions
+          image: ghcr.io/brighk/software-inventory-exporter:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "chown 65532:65532 /data && chmod 700 /data"]
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            capabilities: {drop: [ALL], add: [CHOWN, FOWNER]}
+          volumeMounts: [{name: data, mountPath: /data}]
+      containers:
+        - name: server
+          image: ghcr.io/brighk/software-inventory-exporter:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - --database=/data/inventory.db
+            - --credentials=/etc/software-inventory/credentials.json
+            - --listen=0.0.0.0:9899
+            - --scan-retention-seconds=86400
+          ports:
+            # hostPort on 127.0.0.1 only: the host's agent reaches the API over loopback
+            # (plain HTTP is accepted only there); nothing is exposed on the LAN.
+            - {name: http, containerPort: 9899, hostPort: 9899, hostIP: 127.0.0.1}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 256Mi}
+          securityContext: &hardened
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: credentials, mountPath: /etc/software-inventory, readOnly: true}
+        - name: assess
+          image: ghcr.io/brighk/software-inventory-exporter:0.1.0
+          imagePullPolicy: IfNotPresent
+          # Imports https://security.archlinux.org/issues/all.json and re-assesses hourly;
+          # looks up CVSS for referenced CVEs in the NIST NVD API (cached, refreshed weekly).
+          args: [assess, --database=/data/inventory.db, --interval-seconds=3600]
+          env:
+            # Optional free key (https://nvd.nist.gov/developers/request-an-api-key) raises the
+            # NVD rate limit from ~1 to ~10 lookups per 6 s. Add it as key nvd_api_key.
+            - name: NVD_API_KEY
+              valueFrom:
+                secretKeyRef: {name: software-inventory-credentials, key: nvd_api_key, optional: true}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 256Mi}
+          securityContext: *hardened
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: inventory-db}
+        - name: credentials
+          secret:
+            secretName: software-inventory-credentials
+            items: [{key: credentials.json, path: credentials.json}]
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: software-inventory
+  namespace: software-inventory
+  labels: {app.kubernetes.io/name: software-inventory}
+spec:
+  selector: {app.kubernetes.io/name: software-inventory}
+  ports: [{name: http, port: 9899, targetPort: http}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: software-inventory
+  namespace: software-inventory
+  labels:
+    release: monitoring  # matched by the kube-prometheus-stack Prometheus
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: software-inventory}
+  endpoints:
+    - port: http
+      path: /metrics
+      # Data changes at most hourly; must stay under the 5m staleness window.
+      interval: 2m
+      scrapeTimeout: 30s
+      authorization:
+        type: Bearer
+        credentials: {name: software-inventory-credentials, key: read_token}

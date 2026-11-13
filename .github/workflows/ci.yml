@@ -1,8 +1,13 @@
-name: Rust
-on: [push, pull_request]
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -17,3 +22,10 @@ jobs:
       - run: cargo build --locked
       - run: python3 tests/smoke.py target/debug/software-inventory-exporter
       - run: python3 tests/central_smoke.py target/debug/software-inventory-exporter
+      - run: python3 tests/tls_smoke.py target/debug/software-inventory-exporter
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t software-inventory-exporter:ci .
+      - run: docker run --rm software-inventory-exporter:ci --version

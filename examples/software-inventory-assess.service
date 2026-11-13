@@ -1,0 +1,33 @@
+[Unit]
+Description=Arch security tracker import and inventory assessment
+Wants=network-online.target
+After=network-online.target software-inventory-server.service
+
+[Service]
+Type=simple
+# Central host only. Downloads https://security.archlinux.org/issues/all.json hourly.
+User=software-inventory
+Group=software-inventory
+ExecStart=/usr/local/bin/software-inventory-exporter assess \
+    --database /var/lib/software-inventory/inventory.db
+StateDirectory=software-inventory
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

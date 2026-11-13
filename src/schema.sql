@@ -1,4 +1,3 @@
-BEGIN IMMEDIATE;
 CREATE TABLE hosts (
     id TEXT PRIMARY KEY, hostname TEXT NOT NULL, os TEXT NOT NULL,
     os_version TEXT NOT NULL, architecture TEXT NOT NULL,
@@ -25,4 +24,3 @@ CREATE TABLE installations (
 CREATE UNIQUE INDEX installation_identity ON installations(host_id,collector_id,installation_id,COALESCE(version,''));
 CREATE INDEX installation_name ON installations(name,host_id);
 PRAGMA user_version=1;
-COMMIT;

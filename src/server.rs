@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -107,6 +107,8 @@ async fn ingest(
 struct Filter {
     host_id: Option<String>,
     name: Option<String>,
+    /// Comma-separated effective statuses, e.g. affected,needs_review.
+    status: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -135,6 +137,9 @@ async fn hosts(
     Query(filter): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     authorize_read(&app, &headers)?;
+    if filter.status.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "status applies only to findings"));
+    }
     let (limit, offset) = filter.page()?;
     let rows = database(app, move |db| db.hosts(limit, offset)).await?;
     Ok(Json(json!({"hosts":rows,"limit":limit,"offset":offset})))
@@ -145,6 +150,9 @@ async fn installations(
     Query(filter): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     authorize_read(&app, &headers)?;
+    if filter.status.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "status applies only to findings"));
+    }
     let (limit, offset) = filter.page()?;
     let rows = database(app, move |db| {
         db.installations(
@@ -172,6 +180,16 @@ async fn collectors(
     Ok(Json(json!({"collectors":rows})))
 }
 
+const STATUSES: [&str; 7] = [
+    "affected",
+    "needs_review",
+    "no_known_match",
+    "unsupported",
+    "not_assessed",
+    "pending",
+    "stale_inventory",
+];
+
 async fn findings(
     State(app): State<App>,
     headers: HeaderMap,
@@ -179,8 +197,18 @@ async fn findings(
 ) -> Result<Json<Value>, ApiError> {
     authorize_read(&app, &headers)?;
     let (limit, offset) = filter.page()?;
+    if let Some(status) = &filter.status
+        && !status.split(',').all(|s| STATUSES.contains(&s))
+    {
+        return Err((StatusCode::BAD_REQUEST, "unknown assessment status"));
+    }
     let rows = database(app, move |db| {
-        db.findings(filter.host_id.as_deref(), limit, offset)
+        db.findings(
+            filter.host_id.as_deref(),
+            filter.status.as_deref(),
+            limit,
+            offset,
+        )
     })
     .await?;
     Ok(Json(
@@ -195,7 +223,34 @@ async fn assessment_status(
     Ok(Json(database(app, |db| db.assessment_status()).await?))
 }
 
-pub async fn serve(path: PathBuf, listen: &str, credentials: &Path) -> Result<()> {
+/// How often expired scan summaries are deleted.
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Prometheus exposition of the whole inventory; requires the read credential.
+async fn metrics(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<([(header::HeaderName, &'static str); 1], String), ApiError> {
+    authorize_read(&app, &headers)?;
+    let body = database(app, |db| db.render_metrics()).await?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
+pub async fn serve(
+    path: PathBuf,
+    listen: &str,
+    credentials: &Path,
+    scan_retention_seconds: u64,
+) -> Result<()> {
+    if scan_retention_seconds == 0 || scan_retention_seconds > i64::MAX as u64 {
+        bail!("scan retention must be positive");
+    }
     let credentials: Credentials =
         serde_json::from_slice(&std::fs::read(credentials).context("read server credentials")?)?;
     let mut tokens = HashSet::new();
@@ -213,8 +268,33 @@ pub async fn serve(path: PathBuf, listen: &str, credentials: &Path) -> Result<()
         db: Arc::new(Mutex::new(db)),
         credentials: Arc::new(credentials),
     };
+    let pruner = {
+        let db = app.db.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PRUNE_EVERY);
+            loop {
+                tick.tick().await;
+                let db = db.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let cutoff =
+                        (crate::model::now() as i64).saturating_sub(scan_retention_seconds as i64);
+                    db.lock()
+                        .map_err(|_| anyhow::anyhow!("database lock poisoned"))?
+                        .prune_scans(cutoff)
+                })
+                .await;
+                match result {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => eprintln!("Pruned {n} expired scan summaries"),
+                    Ok(Err(e)) => eprintln!("scan pruning failed: {e:#}"),
+                    Err(e) => eprintln!("scan pruning task: {e}"),
+                }
+            }
+        })
+    };
     let router = Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/metrics", get(metrics))
         .route("/v1/inventory", post(ingest))
         .route("/v1/findings", get(findings))
         .route("/v1/assessment-status", get(assessment_status))
@@ -225,8 +305,9 @@ pub async fn serve(path: PathBuf, listen: &str, credentials: &Path) -> Result<()
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("Inventory server listening on {}", listener.local_addr()?);
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(crate::shutdown())
-        .await?;
-    Ok(())
+        .await;
+    pruner.abort();
+    Ok(result?)
 }

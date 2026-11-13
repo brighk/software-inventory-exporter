@@ -4,8 +4,10 @@ mod collectors;
 mod command;
 mod config;
 mod database;
+mod fleet_metrics;
 mod metrics;
 mod model;
+mod nvd;
 mod protocol;
 mod server;
 
@@ -55,6 +57,10 @@ enum Action {
         listen: String,
         #[arg(long)]
         credentials: PathBuf,
+        /// Delete scan summaries older than this (checked hourly). Each host's
+        /// latest scan is always kept so agent retries stay safe.
+        #[arg(long, default_value_t = 86400)]
+        scan_retention_seconds: u64,
     },
     /// Collect and reliably submit inventory to the central server.
     Agent(agent::Options),
@@ -142,9 +148,16 @@ async fn main() -> Result<()> {
         database,
         listen,
         credentials,
+        scan_retention_seconds,
     } = &cli.command
     {
-        return server::serve(database.clone(), listen, credentials).await;
+        return server::serve(
+            database.clone(),
+            listen,
+            credentials,
+            *scan_retention_seconds,
+        )
+        .await;
     }
     if let Action::Assess(options) = cli.command {
         return tokio::select! { result = assessment::run(options) => result, _ = shutdown() => Ok(()) };

@@ -1,0 +1,38 @@
+[Unit]
+Description=Central software inventory API and SQLite database
+After=network.target
+
+[Service]
+Type=simple
+# Central host only. Shares the database with software-inventory-assess.service.
+User=software-inventory
+Group=software-inventory
+# Loopback by default: put an HTTPS reverse proxy (or a VPN address) in front.
+# credentials.json holds the read token and one upload token per host ID;
+# restart this unit after provisioning hosts or rotating tokens.
+ExecStart=/usr/local/bin/software-inventory-exporter server \
+    --database /var/lib/software-inventory/inventory.db \
+    --credentials /etc/software-inventory-exporter/credentials.json \
+    --listen 127.0.0.1:9899 \
+    --scan-retention-seconds 86400
+StateDirectory=software-inventory
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
