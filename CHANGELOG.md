@@ -6,6 +6,10 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-13
+
+First release.
+
 ### Added
 - Central inventory: `agent` pushes complete snapshots with durable delivery; `server`
   stores them in SQLite behind per-host upload tokens and a read token.
@@ -22,12 +26,8 @@ All notable changes are documented here. The format follows
   trusts an internal CA.
 - `/v1/findings?status=` filtering; scan summaries are kept for 24 hours.
 - Container image, release workflow (static amd64/arm64 binaries, GHCR image).
-
-### Fixed
-- Concurrent first start of server and assessment worker no longer races on schema
-  creation or WAL setup.
-
-## [0.1.0]
-
-- Standalone software inventory exporter: dpkg, rpm, pacman, apk, Snap, Flatpak,
+- Standalone exporter mode (`scan` / `serve`): dpkg, rpm, pacman, apk, Snap, Flatpak,
   Python, npm, Cargo and filesystem collectors with cached Prometheus and JSON endpoints.
+
+[Unreleased]: https://github.com/brighk/software-inventory-exporter/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/brighk/software-inventory-exporter/releases/tag/v0.1.0
