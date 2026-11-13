@@ -1,0 +1,57 @@
+# Explicit collectors replace auto-detection. Remove entries you do not use.
+listen = "127.0.0.1:9898"
+interval_seconds = 900
+timeout_seconds = 30
+max_output_bytes = 16777216
+max_entries = 100000
+export_filesystem = false
+# Empty means all names. This filters /metrics only; JSON stays complete.
+include_names = []
+
+[[collectors]]
+id = "os"
+kind = "dpkg"
+path = "/usr/bin/dpkg-query"
+
+[[collectors]]
+id = "local-bin"
+kind = "filesystem"
+path = "/usr/local/bin"
+max_depth = 1
+
+[[collectors]]
+id = "opt"
+kind = "filesystem"
+path = "/opt"
+max_depth = 4
+
+# Uncomment and adjust actual paths. No '~' or environment-variable expansion.
+# [[collectors]]
+# id = "api-python"
+# kind = "python"
+# path = "/srv/api/.venv/lib/python3.13/site-packages"
+
+# [[collectors]]
+# id = "global-node"
+# kind = "npm"
+# path = "/usr/local/lib/node_modules"
+
+# [[collectors]]
+# id = "api-node"
+# kind = "npm"
+# path = "/srv/api/node_modules"
+
+# [[collectors]]
+# id = "developer-cargo"
+# kind = "cargo"
+# path = "/home/alice/.cargo"
+
+# [[collectors]]
+# id = "snap"
+# kind = "snap"
+# path = "/usr/bin/snap"
+
+# [[collectors]]
+# id = "flatpak"
+# kind = "flatpak"
+# path = "/usr/bin/flatpak"

@@ -1,0 +1,30 @@
+[Unit]
+Description=Linux software inventory exporter
+After=network.target
+
+[Service]
+Type=simple
+# Create this unprivileged account before enabling the service.
+User=software-inventory
+Group=software-inventory
+ExecStart=/usr/local/bin/software-inventory-exporter --config /etc/software-inventory-exporter/config.toml serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+# Allows reading user metadata where ordinary filesystem permissions permit it.
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

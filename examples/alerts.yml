@@ -1,0 +1,25 @@
+groups:
+  - name: software-inventory
+    rules:
+      - alert: SoftwareInventoryExporterDown
+        expr: up{job="software-inventory"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Software inventory exporter unavailable on {{ $labels.instance }}'
+      - alert: SoftwareInventoryCollectorFailed
+        expr: host_software_collector_success == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Inventory collector {{ $labels.scope }} failed on {{ $labels.instance }}'
+      - alert: SoftwareInventoryStale
+        # 1 hour is suitable for the example 15-minute interval; adjust if changed.
+        expr: time() - host_software_collector_last_success_timestamp_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Inventory {{ $labels.scope }} is stale on {{ $labels.instance }}'
