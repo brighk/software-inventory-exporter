@@ -53,14 +53,14 @@ pub struct Options {
 }
 
 pub fn valid_cve(id: &str) -> bool {
-    let mut parts = id.split('-');
+    let mut parts: std::str::Split<'_, char> = id.split('-');
     parts.next() == Some("CVE")
         && parts
             .next()
-            .is_some_and(|y| y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()))
-        && parts
-            .next()
-            .is_some_and(|n| (4..=19).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
+            .is_some_and(|y: &str| y.len() == 4 && y.bytes().all(|b: u8| b.is_ascii_digit()))
+        && parts.next().is_some_and(|n: &str| {
+            (4..=19).contains(&n.len()) && n.bytes().all(|b: u8| b.is_ascii_digit())
+        })
         && parts.next().is_none()
 }
 
@@ -72,14 +72,14 @@ fn select_cvss(cve: &Value) -> Option<Cvss> {
         };
         let mut best: Option<Cvss> = None;
         for entry in entries {
-            let data = &entry["cvssData"];
+            let data: &Value = &entry["cvssData"];
             let Some(score) = data["baseScore"]
                 .as_f64()
-                .filter(|s| (0.0..=10.0).contains(s))
+                .filter(|s: &f64| (0.0..=10.0).contains(s))
             else {
                 continue;
             };
-            let candidate = Cvss {
+            let candidate: Cvss = Cvss {
                 score,
                 // v2 keeps the severity beside cvssData rather than inside it.
                 severity: data["baseSeverity"]
@@ -93,9 +93,9 @@ fn select_cvss(cve: &Value) -> Option<Cvss> {
                 primary: entry["type"].as_str() == Some("Primary"),
             };
             // Within a version prefer NVD's Primary score, then the highest score.
-            let better = best
+            let better: bool = best
                 .as_ref()
-                .is_none_or(|b| (candidate.primary, candidate.score) > (b.primary, b.score));
+                .is_none_or(|b: &Cvss| (candidate.primary, candidate.score) > (b.primary, b.score));
             if better {
                 best = Some(candidate);
             }
@@ -109,25 +109,29 @@ fn select_cvss(cve: &Value) -> Option<Cvss> {
 
 /// Parses an NVD 2.0 response for one CVE ID. `Ok(None)` means NVD has no such record.
 pub fn parse_response(bytes: &[u8], id: &str) -> Result<Option<Details>> {
-    let body: Value = serde_json::from_slice(bytes).context("invalid NVD response")?;
+    let body: Value = serde_json::from_slice::<Value>(bytes).context("invalid NVD response")?;
     let Some(items) = body["vulnerabilities"].as_array() else {
         bail!("NVD response has no vulnerabilities array");
     };
-    let Some(cve) = items.iter().map(|v| &v["cve"]).find(|c| c["id"] == id) else {
+    let Some(cve) = items
+        .iter()
+        .map(|v: &Value| &v["cve"])
+        .find(|c: &&Value| c["id"] == id)
+    else {
         if body["totalResults"].as_u64() == Some(0) {
             return Ok(None);
         }
         bail!("NVD response does not contain {id}");
     };
-    let text = |key: &str| cve[key].as_str().unwrap_or("").to_string();
-    let description = cve["descriptions"]
+    let text = |key: &str| -> String { cve[key].as_str().unwrap_or("").to_string() };
+    let description: String = cve["descriptions"]
         .as_array()
-        .and_then(|d| d.iter().find(|x| x["lang"] == "en"))
-        .and_then(|x| x["value"].as_str())
+        .and_then(|d: &Vec<Value>| d.iter().find(|x: &&Value| x["lang"] == "en"))
+        .and_then(|x: &Value| x["value"].as_str())
         .unwrap_or("")
         .chars()
         .take(2000)
-        .collect();
+        .collect::<String>();
     Ok(Some(Details {
         vuln_status: text("vulnStatus"),
         published: text("published"),
@@ -141,7 +145,7 @@ impl Database {
     /// CVEs referenced by current affected/needs_review findings that are missing from the
     /// cache or older than `stale_before`; never-fetched IDs first.
     pub fn cves_to_fetch(&self, stale_before: i64, limit: i64) -> Result<Vec<String>> {
-        let mut stmt = self.0.prepare(
+        let mut stmt: rusqlite::Statement<'_> = self.0.prepare(
             "SELECT r.id FROM (SELECT DISTINCT c.value AS id FROM assessments a,
                 json_each(a.findings) f, json_each(json_extract(f.value,'$.cves')) c
                 WHERE a.status IN ('affected','needs_review')) r
@@ -149,14 +153,19 @@ impl Database {
              WHERE n.id IS NULL OR n.fetched_at < ?1
              ORDER BY n.fetched_at IS NOT NULL, n.fetched_at, r.id LIMIT ?2",
         )?;
-        let ids = stmt
-            .query_map(params![stale_before, limit], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ids.into_iter().filter(|id| valid_cve(id)).collect())
+        let ids: Vec<String> = stmt
+            .query_map(params![stale_before, limit], |r: &rusqlite::Row<'_>| {
+                r.get::<usize, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids
+            .into_iter()
+            .filter(|id: &String| valid_cve(id))
+            .collect::<Vec<String>>())
     }
 
     pub fn store_cve(&self, id: &str, details: Option<&Details>) -> Result<()> {
-        let c = details.and_then(|d| d.cvss.as_ref());
+        let c: Option<&Cvss> = details.and_then(|d: &Details| d.cvss.as_ref());
         self.0.execute(
             "INSERT INTO nvd_cves(id,fetched_at,found,vuln_status,published,last_modified,description,
                 cvss_score,cvss_severity,cvss_version,cvss_vector,cvss_source,cvss_primary)
@@ -171,23 +180,23 @@ impl Database {
                 id,
                 model::now() as i64,
                 details.is_some(),
-                details.map(|d| &d.vuln_status),
-                details.map(|d| &d.published),
-                details.map(|d| &d.last_modified),
-                details.map(|d| &d.description),
-                c.map(|c| c.score),
-                c.map(|c| &c.severity),
-                c.map(|c| &c.version),
-                c.map(|c| &c.vector),
-                c.map(|c| &c.source),
-                c.map(|c| c.primary),
+                details.map(|d: &Details| &d.vuln_status),
+                details.map(|d: &Details| &d.published),
+                details.map(|d: &Details| &d.last_modified),
+                details.map(|d: &Details| &d.description),
+                c.map(|c: &Cvss| c.score),
+                c.map(|c: &Cvss| &c.severity),
+                c.map(|c: &Cvss| &c.version),
+                c.map(|c: &Cvss| &c.vector),
+                c.map(|c: &Cvss| &c.source),
+                c.map(|c: &Cvss| c.primary),
             ],
         )?;
         Ok(())
     }
 
     pub fn nvd_result(&self, error: Option<&str>) -> Result<()> {
-        let now = model::now() as i64;
+        let now: i64 = model::now() as i64;
         self.0.execute(
             "INSERT INTO nvd_state(id,last_attempt,last_success,success,error)
              VALUES (1,?1,CASE WHEN ?2 IS NULL THEN ?1 END,?2 IS NULL,?2)
@@ -206,31 +215,33 @@ impl Database {
             .query_row(
                 "SELECT success,last_success FROM nvd_state WHERE id=1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r: &rusqlite::Row<'_>| {
+                    Ok((r.get::<usize, bool>(0)?, r.get::<usize, Option<i64>>(1)?))
+                },
             )
             .optional()?)
     }
 
     /// All cached CVSS scores, keyed by CVE ID.
     pub fn cvss_scores(&self) -> Result<HashMap<String, Cvss>> {
-        let mut stmt = self.0.prepare(
+        let mut stmt: rusqlite::Statement<'_> = self.0.prepare(
             "SELECT id,cvss_score,cvss_severity,cvss_version,cvss_vector,cvss_source,cvss_primary
              FROM nvd_cves WHERE cvss_score IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows: rusqlite::MappedRows<'_, _> = stmt.query_map([], |r: &rusqlite::Row<'_>| {
             Ok((
-                r.get::<_, String>(0)?,
+                r.get::<usize, String>(0)?,
                 Cvss {
-                    score: r.get(1)?,
-                    severity: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    version: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    vector: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    source: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                    primary: r.get::<_, Option<bool>>(6)?.unwrap_or(false),
+                    score: r.get::<usize, f64>(1)?,
+                    severity: r.get::<usize, Option<String>>(2)?.unwrap_or_default(),
+                    version: r.get::<usize, Option<String>>(3)?.unwrap_or_default(),
+                    vector: r.get::<usize, Option<String>>(4)?.unwrap_or_default(),
+                    source: r.get::<usize, Option<String>>(5)?.unwrap_or_default(),
+                    primary: r.get::<usize, Option<bool>>(6)?.unwrap_or(false),
                 },
             ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(rows.collect::<rusqlite::Result<HashMap<String, Cvss>>>()?)
     }
 }
 
@@ -239,12 +250,12 @@ pub fn best<'a>(cves: &'a Value, scores: &'a HashMap<String, Cvss>) -> Option<(&
     cves.as_array()?
         .iter()
         .filter_map(Value::as_str)
-        .filter_map(|id| scores.get(id).map(|c| (id, c)))
-        .max_by(|a, b| a.1.score.total_cmp(&b.1.score))
+        .filter_map(|id: &str| scores.get(id).map(|c: &Cvss| (id, c)))
+        .max_by(|a: &(&str, &Cvss), b: &(&str, &Cvss)| a.1.score.total_cmp(&b.1.score))
 }
 
 pub fn to_json(best: Option<(&str, &Cvss)>) -> Value {
-    best.map_or(Value::Null, |(id, c)| {
+    best.map_or(Value::Null, |(id, c): (&str, &Cvss)| {
         json!({"cve":id,"score":c.score,"severity":c.severity,"version":c.version,
                "vector":c.vector,"source":c.source,"primary":c.primary})
     })
@@ -262,13 +273,13 @@ enum Fetch {
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(6), Duration::from_secs(12)];
 
 async fn fetch(client: &reqwest::Client, options: &Options, id: &str) -> Result<Fetch> {
-    let mut request = client.get(&options.url).query(&[("cveId", id)]);
+    let mut request: reqwest::RequestBuilder = client.get(&options.url).query(&[("cveId", id)]);
     if let Some(key) = &options.api_key {
         request = request.header("apiKey", key);
     }
     // reqwest's Display omits the cause (DNS, TLS, reset, timeout); include the chain.
-    let detail = |e: reqwest::Error| format!("{:#}", anyhow::Error::from(e));
-    let mut response = match request.send().await {
+    let detail = |e: reqwest::Error| -> String { format!("{:#}", anyhow::Error::from(e)) };
+    let mut response: reqwest::Response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
             return Ok(Fetch::Transient(format!(
@@ -277,7 +288,7 @@ async fn fetch(client: &reqwest::Client, options: &Options, id: &str) -> Result<
             )));
         }
     };
-    let status = response.status();
+    let status: reqwest::StatusCode = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(Fetch::Done(None));
     }
@@ -287,9 +298,9 @@ async fn fetch(client: &reqwest::Client, options: &Options, id: &str) -> Result<
     if !status.is_success() {
         return Ok(Fetch::Stop(format!("NVD returned {status} for {id}")));
     }
-    let mut bytes = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
     loop {
-        let chunk = match response.chunk().await {
+        let chunk: axum::body::Bytes = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(e) => {
@@ -309,13 +320,13 @@ async fn fetch(client: &reqwest::Client, options: &Options, id: &str) -> Result<
 
 /// One enrichment pass. Returns the number of CVEs looked up.
 pub async fn pass(database: &Path, options: &Options) -> Result<usize> {
-    let path = database.to_path_buf();
-    let stale_before = (model::now() as i64).saturating_sub(options.refresh_seconds as i64);
-    let ids = tokio::task::spawn_blocking(move || {
+    let path: PathBuf = database.to_path_buf();
+    let stale_before: i64 = (model::now() as i64).saturating_sub(options.refresh_seconds as i64);
+    let ids: Vec<String> = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
         Database::open(&path)?.cves_to_fetch(stale_before, MAX_PER_PASS)
     })
     .await??;
-    let client = reqwest::Client::builder()
+    let client: reqwest::Client = reqwest::Client::builder()
         // NVD responses occasionally take tens of seconds.
         .timeout(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
@@ -324,18 +335,18 @@ pub async fn pass(database: &Path, options: &Options) -> Result<usize> {
             env!("CARGO_PKG_VERSION")
         ))
         .build()?;
-    let delay = if options.api_key.is_some() {
+    let delay: Duration = if options.api_key.is_some() {
         DELAY_WITH_KEY
     } else {
         DELAY_WITHOUT_KEY
     };
-    let mut error = None;
-    let mut done = 0;
+    let mut error: Option<String> = None;
+    let mut done: usize = 0;
     for (index, id) in ids.iter().enumerate() {
         if index > 0 {
             tokio::time::sleep(delay).await;
         }
-        let mut outcome = Fetch::Stop("not attempted".into());
+        let mut outcome: Fetch = Fetch::Stop("not attempted".into());
         for attempt in 0..=RETRY_DELAYS.len() {
             if attempt > 0 {
                 tokio::time::sleep(RETRY_DELAYS[attempt - 1]).await;
@@ -349,11 +360,11 @@ pub async fn pass(database: &Path, options: &Options) -> Result<usize> {
                 _ => break,
             }
         }
-        let path = database.to_path_buf();
-        let id = id.clone();
+        let path: PathBuf = database.to_path_buf();
+        let id: String = id.clone();
         match outcome {
             Fetch::Done(details) => {
-                tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || -> Result<()> {
                     Database::open(&path)?.store_cve(&id, details.as_ref())
                 })
                 .await??;
@@ -365,10 +376,12 @@ pub async fn pass(database: &Path, options: &Options) -> Result<usize> {
             }
         }
     }
-    let path = database.to_path_buf();
-    let recorded = error.clone();
-    tokio::task::spawn_blocking(move || Database::open(&path)?.nvd_result(recorded.as_deref()))
-        .await??;
+    let path: PathBuf = database.to_path_buf();
+    let recorded: Option<String> = error.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        Database::open(&path)?.nvd_result(recorded.as_deref())
+    })
+    .await??;
     match error {
         Some(e) => bail!("NVD enrichment stopped after {done} lookups: {e}"),
         None => Ok(done),
@@ -408,7 +421,7 @@ mod tests {
     #[test]
     fn selects_preferred_cvss_and_handles_missing_records() {
         // Shape taken from a live NVD 2.0 response (CVE-2025-6020), plus synthetic metrics.
-        let body = json!({"totalResults":1,"vulnerabilities":[{"cve":{
+        let body: Value = json!({"totalResults":1,"vulnerabilities":[{"cve":{
             "id":"CVE-2025-6020","vulnStatus":"Deferred","published":"2025-06-17T13:15:21.660",
             "lastModified":"2026-11-06T01:17:47.313",
             "descriptions":[{"lang":"es","value":"x"},{"lang":"en","value":"A flaw in linux-pam."}],
@@ -418,36 +431,36 @@ mod tests {
                     {"source":"secalert@redhat.com","type":"Secondary","cvssData":{"version":"3.1","baseScore":7.8,"baseSeverity":"HIGH","vectorString":"CVSS:3.1/AV:L"}},
                     {"source":"nvd@nist.gov","type":"Primary","cvssData":{"version":"3.1","baseScore":5.5,"baseSeverity":"MEDIUM","vectorString":"CVSS:3.1/AV:N"}}],
                 "ssvcV203":[{"source":"cisa","ssvcData":{}}]}}}]});
-        let details = parse_response(body.to_string().as_bytes(), "CVE-2025-6020")
+        let details: Details = parse_response(body.to_string().as_bytes(), "CVE-2025-6020")
             .unwrap()
             .unwrap();
         assert_eq!(details.description, "A flaw in linux-pam.");
         assert_eq!(details.vuln_status, "Deferred");
-        let cvss = details.cvss.unwrap();
+        let cvss: Cvss = details.cvss.unwrap();
         // v3.1 preferred over v4.0; NVD Primary preferred over a higher CNA score.
         assert_eq!(
             (cvss.score, cvss.version.as_str(), cvss.primary),
             (5.5, "3.1", true)
         );
 
-        let v2 = json!({"totalResults":1,"vulnerabilities":[{"cve":{"id":"CVE-2010-0001",
+        let v2: Value = json!({"totalResults":1,"vulnerabilities":[{"cve":{"id":"CVE-2010-0001",
             "metrics":{"cvssMetricV2":[{"source":"nvd@nist.gov","type":"Primary","baseSeverity":"HIGH",
                 "cvssData":{"version":"2.0","baseScore":7.5,"vectorString":"AV:N"}}]}}}]});
-        let cvss = parse_response(v2.to_string().as_bytes(), "CVE-2010-0001")
+        let cvss: Cvss = parse_response(v2.to_string().as_bytes(), "CVE-2010-0001")
             .unwrap()
             .unwrap()
             .cvss
             .unwrap();
         assert_eq!((cvss.score, cvss.severity.as_str()), (7.5, "HIGH"));
 
-        let none = json!({"totalResults":0,"vulnerabilities":[]});
+        let none: Value = json!({"totalResults":0,"vulnerabilities":[]});
         assert!(
             parse_response(none.to_string().as_bytes(), "CVE-2099-0001")
                 .unwrap()
                 .is_none()
         );
-        let unscored = json!({"totalResults":1,"vulnerabilities":[{"cve":{"id":"CVE-2026-0001","vulnStatus":"Received"}}]});
-        let details = parse_response(unscored.to_string().as_bytes(), "CVE-2026-0001")
+        let unscored: Value = json!({"totalResults":1,"vulnerabilities":[{"cve":{"id":"CVE-2026-0001","vulnStatus":"Received"}}]});
+        let details: Details = parse_response(unscored.to_string().as_bytes(), "CVE-2026-0001")
             .unwrap()
             .unwrap();
         assert!(details.cvss.is_none());

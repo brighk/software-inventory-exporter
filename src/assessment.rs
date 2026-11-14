@@ -73,7 +73,7 @@ fn classify(version: &str, advisory: &Advisory) -> Option<&'static str> {
     let Ok(installed) = version.parse::<Version>() else {
         return Some("needs_review");
     };
-    if let Some(fixed) = advisory.fixed.as_deref().filter(|v| !v.is_empty()) {
+    if let Some(fixed) = advisory.fixed.as_deref().filter(|v: &&str| !v.is_empty()) {
         let Ok(fixed) = fixed.parse::<Version>() else {
             return Some("needs_review");
         };
@@ -81,11 +81,11 @@ fn classify(version: &str, advisory: &Advisory) -> Option<&'static str> {
             return None;
         }
     }
-    let exact_affected = advisory
+    let exact_affected: bool = advisory
         .affected
         .as_deref()
-        .and_then(|v| v.parse::<Version>().ok())
-        .is_some_and(|affected| Version::vercmp(&installed, &affected) == 0);
+        .and_then(|v: &str| v.parse::<Version>().ok())
+        .is_some_and(|affected: Version| Version::vercmp(&installed, &affected) == 0);
     if exact_affected && matches!(advisory.status.as_str(), "Vulnerable" | "Fixed") {
         Some("affected")
     } else {
@@ -102,7 +102,7 @@ pub struct Sources {
 }
 
 fn summarize(findings: &[Value]) -> &'static str {
-    if findings.iter().any(|f| f["status"] == "affected") {
+    if findings.iter().any(|f: &Value| f["status"] == "affected") {
         "affected"
     } else if !findings.is_empty() {
         "needs_review"
@@ -113,16 +113,16 @@ fn summarize(findings: &[Value]) -> &'static str {
 
 fn parse_feed(bytes: &[u8]) -> Result<Vec<Advisory>> {
     let feed: Vec<Advisory> =
-        serde_json::from_slice(bytes).context("invalid Arch advisory feed")?;
+        serde_json::from_slice::<Vec<Advisory>>(bytes).context("invalid Arch advisory feed")?;
     if feed.is_empty() || feed.len() > 100_000 {
         bail!("empty or oversized advisory feed");
     }
-    let mut ids = HashSet::new();
+    let mut ids: HashSet<&String> = HashSet::new();
     for advisory in &feed {
         if !advisory.name.starts_with("AVG-")
             || !ids.insert(&advisory.name)
             || advisory.packages.is_empty()
-            || advisory.packages.iter().any(|p| p.is_empty())
+            || advisory.packages.iter().any(|p: &String| p.is_empty())
             || advisory.issues.is_empty()
         {
             bail!("invalid advisory identity, package list or issues");
@@ -134,8 +134,8 @@ fn parse_feed(bytes: &[u8]) -> Result<Vec<Advisory>> {
 impl Database {
     /// Replaces the stored Arch advisories with a downloaded feed.
     pub fn import_arch(&mut self, bytes: &[u8], source: &str) -> Result<usize> {
-        let advisories = parse_feed(bytes)?;
-        let tx = self
+        let advisories: Vec<Advisory> = parse_feed(bytes)?;
+        let tx: rusqlite::Transaction<'_> = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM advisories WHERE source='arch'", [])?;
@@ -145,7 +145,7 @@ impl Database {
                 params![advisory.name, serde_json::to_string(advisory)?],
             )?;
         }
-        let now = model::now() as i64;
+        let now: i64 = model::now() as i64;
         tx.execute("INSERT INTO assessment_state(id,last_attempt,last_success,success,feed_sha256,feed_source) VALUES (1,?1,?1,1,?2,?3)
             ON CONFLICT(id) DO UPDATE SET last_attempt=excluded.last_attempt,last_success=excluded.last_success,success=1,error=NULL,
             feed_sha256=excluded.feed_sha256,feed_source=excluded.feed_source",
@@ -159,18 +159,19 @@ impl Database {
         let imported: bool = self.0.query_row(
             "SELECT EXISTS(SELECT 1 FROM assessment_state WHERE feed_sha256 IS NOT NULL)",
             [],
-            |r| r.get(0),
+            |r: &rusqlite::Row<'_>| r.get::<usize, bool>(0),
         )?;
         if !imported {
             return Ok(None);
         }
-        let mut stmt = self
+        let mut stmt: rusqlite::Statement<'_> = self
             .0
             .prepare("SELECT data FROM advisories WHERE source='arch'")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut advisories = Vec::new();
+        let rows: rusqlite::MappedRows<'_, _> =
+            stmt.query_map([], |r: &rusqlite::Row<'_>| r.get::<usize, String>(0))?;
+        let mut advisories: Vec<Advisory> = Vec::new();
         for row in rows {
-            advisories.push(serde_json::from_str(&row?)?);
+            advisories.push(serde_json::from_str::<Advisory>(&row?)?);
         }
         Ok(Some(advisories))
     }
@@ -185,7 +186,7 @@ impl Database {
 
     /// Re-assesses every installation from the stored Arch advisories and the OSV cache.
     pub fn assess(&mut self, sources: Sources) -> Result<()> {
-        let arch = if sources.arch {
+        let arch: Option<Vec<Advisory>> = if sources.arch {
             self.arch_advisories()?
         } else {
             self.arch_disabled()?;
@@ -197,40 +198,40 @@ impl Database {
                 by_package.entry(package).or_default().push(advisory);
             }
         }
-        let osv = if sources.osv {
+        let osv: Option<crate::osv::Cache> = if sources.osv {
             Some(self.osv_cache()?)
         } else {
             // Like a disabled Arch tracker, a disabled OSV source is not a failure.
             self.osv_result(None)?;
             None
         };
-        let tx = self
+        let tx: rusqlite::Transaction<'_> = self
             .0
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = model::now() as i64;
+        let now: i64 = model::now() as i64;
         tx.execute("DELETE FROM assessments", [])?;
         {
-            let mut stmt = tx.prepare("SELECT i.host_id,i.collector_id,i.installation_id,i.version,i.name,i.source,h.os,h.last_sequence,c.success,c.active,
+            let mut stmt: rusqlite::Statement<'_> = tx.prepare("SELECT i.host_id,i.collector_id,i.installation_id,i.version,i.name,i.source,h.os,h.last_sequence,c.success,c.active,
                 h.os_version,i.source_package,i.source_version,i.evidence
                 FROM installations i JOIN hosts h ON h.id=i.host_id JOIN collectors c ON c.host_id=i.host_id AND c.id=i.collector_id")?;
-            let mut rows = stmt.query([])?;
+            let mut rows: rusqlite::Rows<'_> = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                let host: String = row.get(0)?;
-                let collector: String = row.get(1)?;
-                let identity: String = row.get(2)?;
-                let version: Option<String> = row.get(3)?;
-                let name: String = row.get(4)?;
-                let ecosystem: String = row.get(5)?;
-                let os: String = row.get(6)?;
-                let sequence: i64 = row.get(7)?;
-                let successful: bool = row.get(8)?;
-                let active: bool = row.get(9)?;
-                let os_version: String = row.get(10)?;
-                let source_package: Option<String> = row.get(11)?;
-                let source_version: Option<String> = row.get(12)?;
-                let evidence: String = row.get(13)?;
-                let mut findings = Vec::new();
-                let package = crate::osv::Package {
+                let host: String = row.get::<usize, String>(0)?;
+                let collector: String = row.get::<usize, String>(1)?;
+                let identity: String = row.get::<usize, String>(2)?;
+                let version: Option<String> = row.get::<usize, Option<String>>(3)?;
+                let name: String = row.get::<usize, String>(4)?;
+                let ecosystem: String = row.get::<usize, String>(5)?;
+                let os: String = row.get::<usize, String>(6)?;
+                let sequence: i64 = row.get::<usize, i64>(7)?;
+                let successful: bool = row.get::<usize, bool>(8)?;
+                let active: bool = row.get::<usize, bool>(9)?;
+                let os_version: String = row.get::<usize, String>(10)?;
+                let source_package: Option<String> = row.get::<usize, Option<String>>(11)?;
+                let source_version: Option<String> = row.get::<usize, Option<String>>(12)?;
+                let evidence: String = row.get::<usize, String>(13)?;
+                let mut findings: Vec<Value> = Vec::new();
+                let package: crate::osv::Package<'_> = crate::osv::Package {
                     os: &os,
                     os_version: &os_version,
                     kind: &ecosystem,
@@ -240,9 +241,9 @@ impl Database {
                     source_version: source_version.as_deref(),
                     evidence: &evidence,
                 };
-                let is_arch = os == "arch" && ecosystem == "pacman";
-                let osv_queries = crate::osv::queries(&package);
-                let status = if !successful || !active {
+                let is_arch: bool = os == "arch" && ecosystem == "pacman";
+                let osv_queries: Option<Vec<crate::osv::Query>> = crate::osv::queries(&package);
+                let status: &str = if !successful || !active {
                     "stale_inventory"
                 } else if version.is_none() {
                     if is_arch || osv_queries.is_some() {
@@ -254,7 +255,7 @@ impl Database {
                     if arch.is_none() {
                         "not_assessed"
                     } else {
-                        let version = version.as_deref().unwrap_or("");
+                        let version: &str = version.as_deref().unwrap_or("");
                         for advisory in by_package.get(name.as_str()).into_iter().flatten() {
                             if let Some(status) = classify(version, advisory) {
                                 findings.push(json!({"source":"arch","advisory_id":advisory.name,
@@ -266,10 +267,10 @@ impl Database {
                         summarize(&findings)
                     }
                 } else if let (Some(queries), Some(cache)) = (&osv_queries, &osv) {
-                    let mut complete = true;
+                    let mut complete: bool = true;
                     for query in queries {
                         match cache.queries.get(query) {
-                            Some(ids) => findings.extend(ids.iter().filter_map(|id| {
+                            Some(ids) => findings.extend(ids.iter().filter_map(|id: &String| {
                                 crate::osv::finding(query, id, cache.vulns.get(id))
                             })),
                             None => complete = false,
@@ -302,13 +303,13 @@ impl Database {
     }
     /// Arch tracker import state, with the OSV query state under `osv`.
     pub fn assessment_status(&self) -> Result<Value> {
-        let mut status = self.0.query_row("SELECT last_attempt,last_success,success,error,feed_sha256,feed_source FROM assessment_state WHERE id=1",[],|r| Ok(json!({
-            "last_attempt":r.get::<_,i64>(0)?,"last_success":r.get::<_,Option<i64>>(1)?,"success":r.get::<_,bool>(2)?,
-            "error":r.get::<_,Option<String>>(3)?,"feed_sha256":r.get::<_,Option<String>>(4)?,"feed_source":r.get::<_,Option<String>>(5)?
+        let mut status: Value = self.0.query_row("SELECT last_attempt,last_success,success,error,feed_sha256,feed_source FROM assessment_state WHERE id=1",[],|r: &rusqlite::Row<'_>| Ok(json!({
+            "last_attempt":r.get::<usize, i64>(0)?,"last_success":r.get::<usize, Option<i64>>(1)?,"success":r.get::<usize, bool>(2)?,
+            "error":r.get::<usize, Option<String>>(3)?,"feed_sha256":r.get::<usize, Option<String>>(4)?,"feed_source":r.get::<usize, Option<String>>(5)?
         }))).optional()?.unwrap_or(json!({"success":false,"last_success":null,"error":"not assessed"}));
-        status["osv"] = self.0.query_row("SELECT last_attempt,last_success,success,error FROM osv_state WHERE id=1",[],|r| Ok(json!({
-            "last_attempt":r.get::<_,i64>(0)?,"last_success":r.get::<_,Option<i64>>(1)?,"success":r.get::<_,bool>(2)?,
-            "error":r.get::<_,Option<String>>(3)?
+        status["osv"] = self.0.query_row("SELECT last_attempt,last_success,success,error FROM osv_state WHERE id=1",[],|r: &rusqlite::Row<'_>| Ok(json!({
+            "last_attempt":r.get::<usize, i64>(0)?,"last_success":r.get::<usize, Option<i64>>(1)?,"success":r.get::<usize, bool>(2)?,
+            "error":r.get::<usize, Option<String>>(3)?
         }))).optional()?.unwrap_or(Value::Null);
         Ok(status)
     }
@@ -319,24 +320,24 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Value>> {
-        let mut stmt = self.0.prepare(&format!("SELECT i.host_id,i.collector_id,i.installation_id,i.name,i.version,a.status,a.findings,a.assessed_at,
+        let mut stmt: rusqlite::Statement<'_> = self.0.prepare(&format!("SELECT i.host_id,i.collector_id,i.installation_id,i.name,i.version,a.status,a.findings,a.assessed_at,
             a.sequence,h.last_sequence,c.success,c.active,h.last_seen,
             {EFFECTIVE_STATUS} AS effective
             FROM installations i JOIN hosts h ON h.id=i.host_id JOIN collectors c ON c.host_id=i.host_id AND c.id=i.collector_id
             LEFT JOIN assessments a ON a.host_id=i.host_id AND a.collector_id=i.collector_id AND a.installation_id=i.installation_id AND a.version=COALESCE(i.version,'')
             WHERE (?1 IS NULL OR i.host_id=?1) AND (?4 IS NULL OR instr(','||?4||',', ','||effective||',')>0)
             ORDER BY i.host_id,i.collector_id,i.installation_id,i.version LIMIT ?2 OFFSET ?3"))?;
-        let scores = self.cvss_scores()?;
-        let rows = stmt.query_map(params![host,limit,offset,statuses], |r| {
+        let scores: HashMap<String, crate::nvd::Cvss> = self.cvss_scores()?;
+        let rows: rusqlite::MappedRows<'_, _> = stmt.query_map(params![host,limit,offset,statuses], |r: &rusqlite::Row<'_>| {
             // Effective status is computed in SQL so filtering and pagination agree.
-            let status: String = r.get(13)?;
-            let findings: Option<String> = r.get(6)?;
-            Ok(json!({"host_id":r.get::<_,String>(0)?,"collector_id":r.get::<_,String>(1)?,
-                "installation_id":r.get::<_,String>(2)?,"name":r.get::<_,String>(3)?,"version":r.get::<_,Option<String>>(4)?,
-                "status":status,"findings":with_cvss(findings.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!([])), &scores),
-                "assessed_at":r.get::<_,Option<i64>>(7)?,"host_last_seen":r.get::<_,i64>(12)?}))
+            let status: String = r.get::<usize, String>(13)?;
+            let findings: Option<String> = r.get::<usize, Option<String>>(6)?;
+            Ok(json!({"host_id":r.get::<usize, String>(0)?,"collector_id":r.get::<usize, String>(1)?,
+                "installation_id":r.get::<usize, String>(2)?,"name":r.get::<usize, String>(3)?,"version":r.get::<usize, Option<String>>(4)?,
+                "status":status,"findings":with_cvss(findings.and_then(|s: String| serde_json::from_str::<Value>(&s).ok()).unwrap_or(json!([])), &scores),
+                "assessed_at":r.get::<usize, Option<i64>>(7)?,"host_last_seen":r.get::<usize, i64>(12)?}))
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(rows.collect::<rusqlite::Result<Vec<Value>>>()?)
     }
 }
 
@@ -344,7 +345,7 @@ impl Database {
 fn with_cvss(mut findings: Value, scores: &HashMap<String, crate::nvd::Cvss>) -> Value {
     if let Some(items) = findings.as_array_mut() {
         for finding in items {
-            let cvss = crate::nvd::to_json(crate::nvd::best(&finding["cves"], scores));
+            let cvss: Value = crate::nvd::to_json(crate::nvd::best(&finding["cves"], scores));
             finding["cvss"] = cvss;
         }
     }
@@ -353,9 +354,9 @@ fn with_cvss(mut findings: Value, scores: &HashMap<String, crate::nvd::Cvss>) ->
 
 async fn feed(file: &Option<PathBuf>) -> Result<Vec<u8>> {
     if let Some(path) = file {
-        let path = path.clone();
-        return tokio::task::spawn_blocking(move || {
-            let mut bytes = Vec::new();
+        let path: PathBuf = path.clone();
+        return tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut bytes: Vec<u8> = Vec::new();
             std::fs::File::open(path)?
                 .take(MAX_FEED as u64 + 1)
                 .read_to_end(&mut bytes)?;
@@ -366,15 +367,15 @@ async fn feed(file: &Option<PathBuf>) -> Result<Vec<u8>> {
         })
         .await?;
     }
-    let client = reqwest::Client::builder()
+    let client: reqwest::Client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let mut response = client.get(FEED_URL).send().await?.error_for_status()?;
+    let mut response: reqwest::Response = client.get(FEED_URL).send().await?.error_for_status()?;
     if !response.status().is_success() {
         bail!("unexpected feed response");
     }
-    let mut bytes = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if bytes.len() + chunk.len() > MAX_FEED {
             bail!("feed exceeds 32 MiB");
@@ -395,7 +396,7 @@ impl Database {
                 AND a.installation_id=i.installation_id AND a.version=COALESCE(i.version,'')
              WHERE a.sequence IS NULL OR a.sequence<>h.last_sequence)",
             [],
-            |r| r.get(0),
+            |r: &rusqlite::Row<'_>| r.get::<usize, bool>(0),
         )?)
     }
 }
@@ -410,18 +411,18 @@ pub async fn run(options: Options) -> Result<()> {
     if options.no_arch && options.no_osv {
         bail!("--no-arch and --no-osv together leave nothing to assess");
     }
-    let sources = Sources {
+    let sources: Sources = Sources {
         arch: !options.no_arch,
         osv: !options.no_osv,
     };
-    let nvd = (!options.no_nvd).then(|| crate::nvd::Options {
+    let nvd: Option<crate::nvd::Options> = (!options.no_nvd).then(|| crate::nvd::Options {
         url: options.nvd_url.clone(),
         api_key: std::env::var("NVD_API_KEY")
             .ok()
-            .filter(|k| !k.trim().is_empty()),
+            .filter(|k: &String| !k.trim().is_empty()),
         refresh_seconds: options.nvd_refresh_seconds,
     });
-    let mut nvd_once = None;
+    let mut nvd_once: Option<crate::nvd::Options> = None;
     if let Some(nvd) = nvd {
         if options.once {
             nvd_once = Some(nvd);
@@ -430,29 +431,30 @@ pub async fn run(options: Options) -> Result<()> {
             tokio::spawn(crate::nvd::run(options.database.clone(), nvd));
         }
     }
-    let osv = crate::osv::Options {
+    let osv: crate::osv::Options = crate::osv::Options {
         url: options.osv_url.clone(),
         refresh_seconds: options.osv_refresh_seconds,
     };
-    let source = options
+    let source: String = options
         .feed_file
         .as_ref()
-        .map(|p| format!("file:{}", p.display()))
+        .map(|p: &PathBuf| format!("file:{}", p.display()))
         .unwrap_or(FEED_URL.into());
-    let mut next_download = tokio::time::Instant::now();
-    let mut next_osv = tokio::time::Instant::now();
+    let mut next_download: tokio::time::Instant = tokio::time::Instant::now();
+    let mut next_osv: tokio::time::Instant = tokio::time::Instant::now();
     loop {
-        let mut changed = false;
-        let mut errors = Vec::new();
+        let mut changed: bool = false;
+        let mut errors: Vec<String> = Vec::new();
         if sources.arch && tokio::time::Instant::now() >= next_download {
             next_download =
                 tokio::time::Instant::now() + Duration::from_secs(options.interval_seconds);
-            let downloaded = feed(&options.feed_file).await;
-            let path = options.database.clone();
-            let source = source.clone();
-            let result = tokio::task::spawn_blocking(move || -> Result<usize> {
-                let mut db = Database::open(&path)?;
-                let result = downloaded.and_then(|bytes| db.import_arch(&bytes, &source));
+            let downloaded: Result<Vec<u8>> = feed(&options.feed_file).await;
+            let path: PathBuf = options.database.clone();
+            let source: String = source.clone();
+            let result: Result<usize> = tokio::task::spawn_blocking(move || -> Result<usize> {
+                let mut db: Database = Database::open(&path)?;
+                let result: Result<usize> =
+                    downloaded.and_then(|bytes: Vec<u8>| db.import_arch(&bytes, &source));
                 if let Err(error) = &result {
                     db.assessment_failed(&format!("{error:#}"))?;
                 }
@@ -482,10 +484,10 @@ pub async fn run(options: Options) -> Result<()> {
                 }
             }
         }
-        let path = options.database.clone();
-        let force = changed || options.once;
-        let assessed = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut db = Database::open(&path)?;
+        let path: PathBuf = options.database.clone();
+        let force: bool = changed || options.once;
+        let assessed: Result<bool> = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut db: Database = Database::open(&path)?;
             if !force && !db.has_unassessed_inventory()? {
                 return Ok(false);
             }
@@ -503,7 +505,7 @@ pub async fn run(options: Options) -> Result<()> {
         }
         if options.once {
             if let Some(nvd) = &nvd_once {
-                let n = crate::nvd::pass(&options.database, nvd).await?;
+                let n: usize = crate::nvd::pass(&options.database, nvd).await?;
                 eprintln!("NVD enrichment updated {n} CVEs");
             }
             if !errors.is_empty() {
@@ -511,7 +513,7 @@ pub async fn run(options: Options) -> Result<()> {
             }
             return Ok(());
         }
-        let mut wake = NEW_INVENTORY_CHECK;
+        let mut wake: Duration = NEW_INVENTORY_CHECK;
         if sources.arch {
             wake = wake.min(next_download.saturating_duration_since(tokio::time::Instant::now()));
         }
@@ -529,27 +531,28 @@ mod tests {
     };
 
     fn host(db: &mut Database, id: &str, os: &str, kind: Kind, items: Vec<(&str, Option<&str>)>) {
-        let c = Collector {
+        let c: Collector = Collector {
             id: "os".into(),
             kind,
             path: "/usr/bin/true".into(),
             max_depth: 1,
         };
-        let mut inventory = Inventory {
+        let mut inventory: Inventory = Inventory {
             schema_version: 1,
             initial_scan_complete: true,
             ..Inventory::default()
         };
-        let software = items
+        let software: Vec<Software> = items
             .into_iter()
-            .map(|(name, source)| {
-                let item = Software::new(&c, name, "1.0-1", "", None, "package database", "");
+            .map(|(name, source): (&str, Option<&str>)| {
+                let item: Software =
+                    Software::new(&c, name, "1.0-1", "", None, "package database", "");
                 match source {
                     Some(source) => item.with_source(source, ""),
                     None => item,
                 }
             })
-            .collect();
+            .collect::<Vec<Software>>();
         inventory.apply(&c, Ok(software), 100, 0.1);
         db.ingest(&Submission {
             protocol_version: 1,
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn statuses_without_advisory_data() {
-        let mut db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        let mut db: Database = Database::open(std::path::Path::new(":memory:")).unwrap();
         host(
             &mut db,
             "deb",
@@ -582,13 +585,13 @@ mod tests {
             db.findings(None, None, 100, 0)
                 .unwrap()
                 .iter()
-                .map(|f| {
+                .map(|f: &Value| {
                     (
                         f["name"].as_str().unwrap().into(),
                         f["status"].as_str().unwrap().into(),
                     )
                 })
-                .collect()
+                .collect::<Vec<(String, String)>>()
         };
         db.assess(Sources {
             arch: true,
@@ -596,7 +599,7 @@ mod tests {
         })
         .unwrap();
         // No feed imported and no OSV result cached: nothing is reported as clean.
-        let s = status(&db);
+        let s: Vec<(String, String)> = status(&db);
         assert!(s.contains(&("demo".into(), "not_assessed".into())), "{s:?}");
         assert!(
             s.contains(&("libfoo1".into(), "not_assessed".into())),
@@ -605,7 +608,9 @@ mod tests {
         // A dpkg record without a source package (old agent) and Fedora are not covered.
         assert!(s.contains(&("old".into(), "unsupported".into())), "{s:?}");
         assert_eq!(
-            s.iter().filter(|x| x.1 == "unsupported").count(),
+            s.iter()
+                .filter(|x: &&(String, String)| x.1 == "unsupported")
+                .count(),
             2,
             "{s:?}"
         );
@@ -619,13 +624,15 @@ mod tests {
             osv: true,
         })
         .unwrap();
-        let s = status(&db);
+        let s: Vec<(String, String)> = status(&db);
         assert!(
             s.contains(&("libfoo1".into(), "no_known_match".into())),
             "{s:?}"
         );
         assert_eq!(
-            s.iter().filter(|x| x.1 == "unsupported").count(),
+            s.iter()
+                .filter(|x: &&(String, String)| x.1 == "unsupported")
+                .count(),
             3,
             "{s:?}"
         );
@@ -637,7 +644,7 @@ mod tests {
     }
     #[test]
     fn arch_versions_and_uncertainty() {
-        let mut a = Advisory {
+        let mut a: Advisory = Advisory {
             name: "AVG-1".into(),
             packages: vec!["demo".into()],
             status: "Fixed".into(),

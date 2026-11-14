@@ -43,7 +43,7 @@ impl Software {
         evidence: &str,
         identity: &str,
     ) -> Self {
-        let key = format!(
+        let key: String = format!(
             "{}\0{}\0{}\0{}\0{}",
             c.kind.name(),
             c.id,
@@ -51,7 +51,7 @@ impl Software {
             arch,
             identity
         );
-        let hash = Sha256::digest(key.as_bytes());
+        let hash: sha2::digest::Output<Sha256> = Sha256::digest(key.as_bytes());
         Self {
             name: name.into(),
             version: if version.is_empty() {
@@ -71,12 +71,12 @@ impl Software {
     }
     /// Records the source package; empty or unknown values are ignored.
     pub fn with_source(mut self, name: &str, version: &str) -> Self {
-        let known = |v: &str| !v.is_empty() && v != "(none)";
+        let known = |v: &str| -> bool { !v.is_empty() && v != "(none)" };
         if known(name) {
             self.source_package = Some(name.into());
             self.source_version = known(version)
                 .then(|| version.to_string())
-                .filter(|v| Some(v) != self.version.as_ref());
+                .filter(|v: &String| Some(v) != self.version.as_ref());
         }
         self
     }
@@ -107,7 +107,7 @@ impl Inventory {
         timestamp: u64,
         duration: f64,
     ) {
-        let state = self.collectors.entry(c.id.clone()).or_default();
+        let state: &mut CollectorState = self.collectors.entry(c.id.clone()).or_default();
         state.source = c.kind.name().into();
         state.max_depth = c.max_depth;
         state.path = c.path.clone();
@@ -115,7 +115,7 @@ impl Inventory {
         state.duration_seconds = duration;
         match result {
             Ok(mut items) => {
-                items.sort_by(|a, b| {
+                items.sort_by(|a: &Software, b: &Software| -> std::cmp::Ordering {
                     (&a.name, &a.installation_id, &a.version).cmp(&(
                         &b.name,
                         &b.installation_id,

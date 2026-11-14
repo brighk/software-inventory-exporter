@@ -14,13 +14,13 @@ fn header(out: &mut String, name: &str, help: &str) {
     writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge").unwrap();
 }
 pub fn render(inventory: &Inventory, config: &Config) -> String {
-    let mut out = String::new();
+    let mut out: String = String::new();
     header(
         &mut out,
         "host_software_info",
         "Observed software installation; may be cached after collector failure.",
     );
-    let mut samples = BTreeSet::new();
+    let mut samples: BTreeSet<String> = BTreeSet::new();
     for state in inventory.collectors.values() {
         for item in &state.software {
             if item.source == Kind::Filesystem && !config.export_filesystem {
@@ -61,7 +61,7 @@ pub fn render(inventory: &Inventory, config: &Config) -> String {
     ] {
         header(&mut out, name, help);
         for (id, state) in &inventory.collectors {
-            let value = match name {
+            let value: f64 = match name {
                 "host_software_collector_success" => u8::from(state.success) as f64,
                 "host_software_collector_last_attempt_timestamp_seconds" => {
                     state.last_attempt_timestamp_seconds as f64
@@ -101,13 +101,13 @@ mod tests {
     #[test]
     fn escaping_and_failed_refresh_preserve_inventory() {
         assert_eq!(escape("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
-        let c = Collector {
+        let c: Collector = Collector {
             id: "os".into(),
             kind: Kind::Dpkg,
             path: "/usr/bin/dpkg-query".into(),
             max_depth: 1,
         };
-        let mut inv = Inventory::default();
+        let mut inv: Inventory = Inventory::default();
         inv.apply(
             &c,
             Ok(vec![Software::new(&c, "demo", "1", "", None, "test", "")]),
@@ -119,7 +119,7 @@ mod tests {
             inv.collectors["os"].last_success_timestamp_seconds,
             Some(100)
         );
-        let metrics = render(&inv, &Config::default());
+        let metrics: String = render(&inv, &Config::default());
         assert!(metrics.contains("version=\"1\""));
         assert!(
             metrics.contains("host_software_collector_success{scope=\"os\",source=\"dpkg\"} 0")
@@ -129,16 +129,16 @@ mod tests {
     }
     #[test]
     fn filters_only_metrics_and_deduplicates_samples() {
-        let c = Collector {
+        let c: Collector = Collector {
             id: "fs".into(),
             kind: Kind::Filesystem,
             path: "/opt".into(),
             max_depth: 1,
         };
-        let item = Software::new(&c, "demo", "", "", None, "test", "");
-        let mut inv = Inventory::default();
+        let item: Software = Software::new(&c, "demo", "", "", None, "test", "");
+        let mut inv: Inventory = Inventory::default();
         inv.apply(&c, Ok(vec![item.clone(), item]), 1, 0.0);
-        let mut cfg = Config::default();
+        let mut cfg: Config = Config::default();
         assert!(!render(&inv, &cfg).contains("name=\"demo\""));
         cfg.export_filesystem = true;
         assert_eq!(render(&inv, &cfg).matches("name=\"demo\"").count(), 1);

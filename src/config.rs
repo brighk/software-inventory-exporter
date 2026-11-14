@@ -66,7 +66,7 @@ impl Kind {
 }
 impl Default for Config {
     fn default() -> Self {
-        let mut collectors = Vec::new();
+        let mut collectors: Vec<Collector> = Vec::new();
         for (kind, path) in [
             (Kind::Dpkg, "/usr/bin/dpkg-query"),
             (Kind::Rpm, "/usr/bin/rpm"),
@@ -114,13 +114,13 @@ impl Config {
         if self.max_output_bytes > 256 * 1024 * 1024 || self.max_entries > 1_000_000 {
             bail!("limits exceed maximum: 256 MiB output, 1,000,000 entries");
         }
-        let mut ids = HashSet::new();
+        let mut ids: HashSet<&String> = HashSet::new();
         for c in &self.collectors {
             if c.id.is_empty()
                 || !c
                     .id
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    .all(|b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
                 || !ids.insert(&c.id)
             {
                 bail!("collector IDs must be unique and contain only letters, numbers, '_' or '-'");
@@ -138,7 +138,7 @@ mod tests {
     use super::*;
     #[test]
     fn config_rejects_invalid_limits_paths_and_duplicates() {
-        let mut config = Config {
+        let mut config: Config = Config {
             interval_seconds: 0,
             ..Config::default()
         };
@@ -159,7 +159,8 @@ mod tests {
     }
     #[test]
     fn example_config_is_valid() {
-        let config: Config = toml::from_str(include_str!("../examples/config.toml")).unwrap();
+        let config: Config =
+            toml::from_str::<Config>(include_str!("../examples/config.toml")).unwrap();
         config.validate().unwrap();
         assert_eq!(config.collectors.len(), 3);
         assert!(

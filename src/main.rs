@@ -127,9 +127,9 @@ async fn ready_handler(State(state): State<Shared>) -> StatusCode {
 }
 async fn scan(inv: &mut Inventory, config: &Config) {
     for c in &config.collectors {
-        let timestamp = model::now();
-        let start = Instant::now();
-        let result = collectors::collect(c, config).await;
+        let timestamp: u64 = model::now();
+        let start: Instant = Instant::now();
+        let result: Result<Vec<model::Software>> = collectors::collect(c, config).await;
         if let Err(ref error) = result {
             eprintln!("collector {} failed: {error:#}", c.id);
         }
@@ -138,13 +138,14 @@ async fn scan(inv: &mut Inventory, config: &Config) {
     inv.initial_scan_complete = true;
 }
 async fn shutdown() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("register SIGTERM");
+    let mut term: tokio::signal::unix::Signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("register SIGTERM");
     tokio::select! { _ = tokio::signal::ctrl_c() => (), _ = term.recv() => () }
 }
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli: Cli = Cli::parse();
     if let Action::Server {
         database,
         listen,
@@ -163,7 +164,7 @@ async fn main() -> Result<()> {
     if let Action::Assess(options) = cli.command {
         return tokio::select! { result = assessment::run(options) => result, _ = shutdown() => Ok(()) };
     }
-    let mut config = match cli.config {
+    let mut config: Config = match cli.config {
         Some(path) => toml::from_str::<Config>(
             &std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
         )?,
@@ -178,17 +179,17 @@ async fn main() -> Result<()> {
         });
     }
     if cli.include_path {
-        let mut paths: Vec<_> =
+        let mut paths: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .filter(|p| p.is_absolute())
-                .collect();
+                .filter(|p: &PathBuf| p.is_absolute())
+                .collect::<Vec<PathBuf>>();
         paths.sort();
         paths.dedup();
         for (index, path) in paths.into_iter().enumerate() {
             if !config
                 .collectors
                 .iter()
-                .any(|c| c.kind == Kind::Filesystem && c.path == path)
+                .any(|c: &Collector| c.kind == Kind::Filesystem && c.path == path)
             {
                 config.collectors.push(Collector {
                     id: format!("path-{index}"),
@@ -212,7 +213,7 @@ async fn main() -> Result<()> {
         }
     }
     config.validate()?;
-    let mut inv = Inventory {
+    let mut inv: Inventory = Inventory {
         schema_version: 1,
         ..Inventory::default()
     };
@@ -241,20 +242,21 @@ async fn main() -> Result<()> {
                 Format::Json => println!("{}", serde_json::to_string_pretty(&inv)?),
                 Format::Metrics => print!("{}", metrics::render(&inv, &config)),
             }
-            if inv.collectors.values().any(|s| !s.success) {
+            if inv.collectors.values().any(|s: &CollectorState| !s.success) {
                 std::process::exit(2);
             }
         }
         Action::Serve { .. } => {
-            let listener = tokio::net::TcpListener::bind(&config.listen).await?;
+            let listener: tokio::net::TcpListener =
+                tokio::net::TcpListener::bind(&config.listen).await?;
             eprintln!(
                 "Listening on {}; scan interval {}s",
                 listener.local_addr()?,
                 config.interval_seconds
             );
-            let state = Arc::new(RwLock::new(cache(&inv, &config)?));
-            let worker_state = state.clone();
-            let worker = tokio::spawn(async move {
+            let state: Shared = Arc::new(RwLock::new(cache(&inv, &config)?));
+            let worker_state: Shared = state.clone();
+            let worker: tokio::task::JoinHandle<()> = tokio::spawn(async move {
                 loop {
                     scan(&mut inv, &config).await;
                     match cache(&inv, &config) {
@@ -265,13 +267,13 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(config.interval_seconds)).await;
                 }
             });
-            let app = Router::new()
+            let app: Router = Router::new()
                 .route("/metrics", get(metrics_handler))
                 .route("/inventory", get(inventory_handler))
                 .route("/healthz", get(|| async { "ok\n" }))
                 .route("/readyz", get(ready_handler))
                 .with_state(state);
-            let result = axum::serve(listener, app)
+            let result: std::io::Result<()> = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await;
             worker.abort();

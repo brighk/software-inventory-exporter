@@ -49,7 +49,7 @@ impl Submission {
         if self.inventory.collectors.len() > 128 {
             bail!("too many collectors");
         }
-        let mut count = 0;
+        let mut count: usize = 0;
         for (id, state) in &self.inventory.collectors {
             if !valid_id(id)
                 || !state.path.is_absolute()
@@ -59,12 +59,12 @@ impl Submission {
                 || state.last_attempt_timestamp_seconds > i64::MAX as u64
                 || state
                     .last_success_timestamp_seconds
-                    .is_some_and(|t| t > state.last_attempt_timestamp_seconds)
+                    .is_some_and(|t: u64| t > state.last_attempt_timestamp_seconds)
             {
                 bail!("invalid collector metadata: {id}");
             }
             let source: crate::config::Kind =
-                serde_json::from_value(serde_json::json!(state.source))?;
+                serde_json::from_value::<crate::config::Kind>(serde_json::json!(state.source))?;
             if state.success
                 && (state.error.is_some()
                     || state.last_success_timestamp_seconds
@@ -75,7 +75,7 @@ impl Submission {
             if !state.success && state.error.is_none() {
                 bail!("failed collector must include an error: {id}");
             }
-            let mut identities = HashSet::new();
+            let mut identities: HashSet<(&String, &Option<String>)> = HashSet::new();
             for item in &state.software {
                 count += 1;
                 if count > 100_000
@@ -83,11 +83,17 @@ impl Submission {
                     || item.source != source
                     || item.name.trim().is_empty()
                     || item.name.len() > 4096
-                    || [&item.source_package, &item.source_version]
-                        .iter()
-                        .any(|v| v.as_ref().is_some_and(|v| v.is_empty() || v.len() > 4096))
+                    || [&item.source_package, &item.source_version].iter().any(
+                        |v: &&Option<String>| {
+                            v.as_ref()
+                                .is_some_and(|v: &String| v.is_empty() || v.len() > 4096)
+                        },
+                    )
                     || item.installation_id.len() != 24
-                    || !item.installation_id.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !item
+                        .installation_id
+                        .bytes()
+                        .all(|b: u8| b.is_ascii_hexdigit())
                     || !identities.insert((&item.installation_id, &item.version))
                 {
                     bail!("invalid or duplicate installation in {id}");
@@ -103,5 +109,5 @@ pub fn valid_id(value: &str) -> bool {
         && value.len() <= 128
         && value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .all(|b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }

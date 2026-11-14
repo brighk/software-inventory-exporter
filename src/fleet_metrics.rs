@@ -15,33 +15,35 @@ fn header(out: &mut String, name: &str, help: &str) {
 fn sample(name: &str, labels: &[(&str, &str)], value: impl std::fmt::Display) -> String {
     let labels: Vec<String> = labels
         .iter()
-        .map(|(k, v)| format!("{k}=\"{}\"", escape(v)))
-        .collect();
+        .map(|(k, v): &(&str, &str)| format!("{k}=\"{}\"", escape(v)))
+        .collect::<Vec<String>>();
     format!("{name}{{{}}} {value}\n", labels.join(","))
 }
 
 impl Database {
     pub fn render_metrics(&self) -> Result<String> {
-        let scores = self.cvss_scores()?;
-        let mut cvss_scores = BTreeSet::new();
-        let mut packages = BTreeSet::new();
-        let mut vulnerabilities = BTreeSet::new();
-        let mut stmt = self.0.prepare(&format!(
+        let scores: std::collections::HashMap<String, crate::nvd::Cvss> = self.cvss_scores()?;
+        let mut cvss_scores: BTreeSet<String> = BTreeSet::new();
+        let mut packages: BTreeSet<String> = BTreeSet::new();
+        let mut vulnerabilities: BTreeSet<String> = BTreeSet::new();
+        let mut stmt: rusqlite::Statement<'_> = self.0.prepare(&format!(
             "SELECT i.host_id,h.hostname,i.collector_id,i.name,i.version,a.findings,{EFFECTIVE_STATUS}
              FROM installations i JOIN hosts h ON h.id=i.host_id
              JOIN collectors c ON c.host_id=i.host_id AND c.id=i.collector_id
              LEFT JOIN assessments a ON a.host_id=i.host_id AND a.collector_id=i.collector_id
                 AND a.installation_id=i.installation_id AND a.version=COALESCE(i.version,'')"
         ))?;
-        let mut rows = stmt.query([])?;
+        let mut rows: rusqlite::Rows<'_> = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            let host: String = r.get(0)?;
-            let hostname: String = r.get(1)?;
-            let collector: String = r.get(2)?;
-            let name: String = r.get(3)?;
-            let version = r.get::<_, Option<String>>(4)?.unwrap_or("unknown".into());
-            let findings: Option<String> = r.get(5)?;
-            let status: String = r.get(6)?;
+            let host: String = r.get::<usize, String>(0)?;
+            let hostname: String = r.get::<usize, String>(1)?;
+            let collector: String = r.get::<usize, String>(2)?;
+            let name: String = r.get::<usize, String>(3)?;
+            let version: String = r
+                .get::<usize, Option<String>>(4)?
+                .unwrap_or("unknown".into());
+            let findings: Option<String> = r.get::<usize, Option<String>>(5)?;
+            let status: String = r.get::<usize, String>(6)?;
             packages.insert(sample(
                 "software_inventory_package_info",
                 &[
@@ -58,18 +60,18 @@ impl Database {
                 continue;
             }
             let findings: Vec<Value> = findings
-                .and_then(|f| serde_json::from_str(&f).ok())
+                .and_then(|f: String| serde_json::from_str::<Vec<Value>>(&f).ok())
                 .unwrap_or_default();
             for f in findings {
-                let text = |key: &str| f[key].as_str().unwrap_or("").to_string();
-                let fixed = text("fixed_version");
-                let best = crate::nvd::best(&f["cves"], &scores);
-                let score = best
-                    .map(|(_, c)| format!("{:.1}", c.score))
+                let text = |key: &str| -> String { f[key].as_str().unwrap_or("").to_string() };
+                let fixed: String = text("fixed_version");
+                let best: Option<(&str, &crate::nvd::Cvss)> = crate::nvd::best(&f["cves"], &scores);
+                let score: String = best
+                    .map(|(_, c): (&str, &crate::nvd::Cvss)| format!("{:.1}", c.score))
                     .unwrap_or_default();
                 let cves: Vec<&str> = f["cves"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .map(|a: &Vec<Value>| a.iter().filter_map(Value::as_str).collect::<Vec<&str>>())
                     .unwrap_or_default();
                 vulnerabilities.insert(sample(
                     "software_inventory_vulnerability_info",
@@ -93,10 +95,18 @@ impl Database {
                         ("cvss_score", &score),
                         (
                             "cvss_severity",
-                            best.map_or("", |(_, c)| c.severity.as_str()),
+                            best.map_or("", |(_, c): (&str, &crate::nvd::Cvss)| {
+                                c.severity.as_str()
+                            }),
                         ),
-                        ("cvss_version", best.map_or("", |(_, c)| c.version.as_str())),
-                        ("cvss_cve", best.map_or("", |(id, _)| id)),
+                        (
+                            "cvss_version",
+                            best.map_or("", |(_, c): (&str, &crate::nvd::Cvss)| c.version.as_str()),
+                        ),
+                        (
+                            "cvss_cve",
+                            best.map_or("", |(id, _): (&str, &crate::nvd::Cvss)| id),
+                        ),
                     ],
                     1,
                 ));
@@ -115,41 +125,46 @@ impl Database {
                 }
             }
         }
-        let mut out = String::new();
+        let mut out: String = String::new();
         header(
             &mut out,
             "software_inventory_package_info",
             "Installed package per host with its effective assessment status.",
         );
-        packages.into_iter().for_each(|s| out.push_str(&s));
+        packages.into_iter().for_each(|s: String| out.push_str(&s));
         header(
             &mut out,
             "software_inventory_vulnerability_info",
             "Advisory finding on a package whose status is affected or needs_review.",
         );
-        vulnerabilities.into_iter().for_each(|s| out.push_str(&s));
+        vulnerabilities
+            .into_iter()
+            .for_each(|s: String| out.push_str(&s));
         header(
             &mut out,
             "software_inventory_vulnerability_cvss_score",
             "Highest NVD CVSS base score among the finding's CVEs (absent when unscored).",
         );
-        cvss_scores.into_iter().for_each(|s| out.push_str(&s));
+        cvss_scores
+            .into_iter()
+            .for_each(|s: String| out.push_str(&s));
 
         header(
             &mut out,
             "software_inventory_host_last_seen_timestamp_seconds",
             "Server receipt time of the host's latest accepted inventory.",
         );
-        let mut stmt = self
+        let mut stmt: rusqlite::Statement<'_> = self
             .0
             .prepare("SELECT id,hostname,last_seen FROM hosts ORDER BY id")?;
-        let mut rows = stmt.query([])?;
+        let mut rows: rusqlite::Rows<'_> = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            let (id, hostname): (String, String) = (r.get(0)?, r.get(1)?);
+            let (id, hostname): (String, String) =
+                (r.get::<usize, String>(0)?, r.get::<usize, String>(1)?);
             out.push_str(&sample(
                 "software_inventory_host_last_seen_timestamp_seconds",
                 &[("host_id", &id), ("hostname", &hostname)],
-                r.get::<_, i64>(2)?,
+                r.get::<usize, i64>(2)?,
             ));
         }
         header(
@@ -157,16 +172,17 @@ impl Database {
             "software_inventory_collector_success",
             "Whether the host's latest attempt for this active collector succeeded.",
         );
-        let mut stmt = self
+        let mut stmt: rusqlite::Statement<'_> = self
             .0
             .prepare("SELECT host_id,id,success FROM collectors WHERE active=1 ORDER BY 1,2")?;
-        let mut rows = stmt.query([])?;
+        let mut rows: rusqlite::Rows<'_> = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            let (host, id): (String, String) = (r.get(0)?, r.get(1)?);
+            let (host, id): (String, String) =
+                (r.get::<usize, String>(0)?, r.get::<usize, String>(1)?);
             out.push_str(&sample(
                 "software_inventory_collector_success",
                 &[("host_id", &host), ("collector", &id)],
-                r.get::<_, i64>(2)?,
+                r.get::<usize, i64>(2)?,
             ));
         }
         let state: Option<(bool, Option<i64>)> = self
@@ -174,7 +190,9 @@ impl Database {
             .query_row(
                 "SELECT success,last_success FROM assessment_state WHERE id=1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r: &rusqlite::Row<'_>| {
+                    Ok((r.get::<usize, bool>(0)?, r.get::<usize, Option<i64>>(1)?))
+                },
             )
             .optional()?;
         header(
@@ -185,7 +203,7 @@ impl Database {
         writeln!(
             out,
             "software_inventory_assessment_success {}",
-            u8::from(state.is_some_and(|s| s.0))
+            u8::from(state.is_some_and(|s: (bool, Option<i64>)| s.0))
         )?;
         header(
             &mut out,
@@ -195,9 +213,9 @@ impl Database {
         writeln!(
             out,
             "software_inventory_assessment_last_success_timestamp_seconds {}",
-            state.and_then(|s| s.1).unwrap_or(0)
+            state.and_then(|s: (bool, Option<i64>)| s.1).unwrap_or(0)
         )?;
-        let osv = self.osv_state()?;
+        let osv: Option<(bool, Option<i64>)> = self.osv_state()?;
         header(
             &mut out,
             "software_inventory_osv_success",
@@ -206,7 +224,7 @@ impl Database {
         writeln!(
             out,
             "software_inventory_osv_success {}",
-            u8::from(osv.is_some_and(|s| s.0))
+            u8::from(osv.is_some_and(|s: (bool, Option<i64>)| s.0))
         )?;
         header(
             &mut out,
@@ -216,9 +234,9 @@ impl Database {
         writeln!(
             out,
             "software_inventory_osv_last_success_timestamp_seconds {}",
-            osv.and_then(|s| s.1).unwrap_or(0)
+            osv.and_then(|s: (bool, Option<i64>)| s.1).unwrap_or(0)
         )?;
-        let nvd = self.nvd_state()?;
+        let nvd: Option<(bool, Option<i64>)> = self.nvd_state()?;
         header(
             &mut out,
             "software_inventory_nvd_success",
@@ -227,7 +245,7 @@ impl Database {
         writeln!(
             out,
             "software_inventory_nvd_success {}",
-            u8::from(nvd.is_some_and(|s| s.0))
+            u8::from(nvd.is_some_and(|s: (bool, Option<i64>)| s.0))
         )?;
         header(
             &mut out,
@@ -237,7 +255,7 @@ impl Database {
         writeln!(
             out,
             "software_inventory_nvd_last_success_timestamp_seconds {}",
-            nvd.and_then(|s| s.1).unwrap_or(0)
+            nvd.and_then(|s: (bool, Option<i64>)| s.1).unwrap_or(0)
         )?;
         header(
             &mut out,

@@ -34,23 +34,26 @@ pub async fn collect(c: &Collector, config: &Config) -> Result<Vec<Software>> {
             ],
             _ => unreachable!(),
         };
-        let output = command::run(
+        let output: String = command::run(
             &c.path,
             args,
             Duration::from_secs(config.timeout_seconds),
             config.max_output_bytes,
         )
         .await?;
-        let items = parse_command(c, &output)?;
+        let items: Vec<Software> = parse_command(c, &output)?;
         if items.len() > config.max_entries {
             bail!("inventory exceeded entry limit");
         }
         Ok(items)
     } else {
-        let c = c.clone();
-        let config = config.clone();
-        let limit = config.max_entries;
-        let items = tokio::task::spawn_blocking(move || collect_files(&c, &config)).await??;
+        let c: Collector = c.clone();
+        let config: Config = config.clone();
+        let limit: usize = config.max_entries;
+        let items: Vec<Software> = tokio::task::spawn_blocking(move || -> Result<Vec<Software>> {
+            collect_files(&c, &config)
+        })
+        .await??;
         if items.len() > limit {
             bail!("inventory exceeded entry limit");
         }
@@ -62,14 +65,14 @@ pub async fn collect(c: &Collector, config: &Config) -> Result<Vec<Software>> {
 }
 
 pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
-    let mut items = Vec::new();
+    let mut items: Vec<Software> = Vec::new();
     for (line_number, line) in output.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let item = match c.kind {
+        let item: Software = match c.kind {
             Kind::Dpkg => {
-                let fields: Vec<_> = line.split('\t').collect();
+                let fields: Vec<&str> = line.split('\t').collect::<Vec<&str>>();
                 if fields.len() != 6 {
                     bail!("invalid dpkg record at line {}", line_number + 1);
                 }
@@ -88,7 +91,7 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
                 .with_source(fields[4], fields[5])
             }
             Kind::Rpm => {
-                let fields: Vec<_> = line.split('\t').collect();
+                let fields: Vec<&str> = line.split('\t').collect::<Vec<&str>>();
                 if fields.len() != 4 {
                     bail!("invalid rpm record");
                 }
@@ -104,7 +107,7 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
                 .with_source(source_rpm_name(fields[3]).unwrap_or(""), "")
             }
             Kind::Pacman => {
-                let fields: Vec<_> = line.split_whitespace().collect();
+                let fields: Vec<&str> = line.split_whitespace().collect::<Vec<&str>>();
                 if fields.len() != 2 {
                     bail!("invalid pacman record");
                 }
@@ -117,7 +120,7 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
                 if line.trim() == "No snaps are installed yet. Try 'snap install hello-world'." {
                     continue;
                 }
-                let fields: Vec<_> = line.split_whitespace().collect();
+                let fields: Vec<&str> = line.split_whitespace().collect::<Vec<&str>>();
                 if fields.len() < 6 {
                     bail!("invalid snap record");
                 }
@@ -132,11 +135,11 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
                 )
             }
             Kind::Flatpak => {
-                let fields: Vec<_> = line.split('\t').collect();
+                let fields: Vec<&str> = line.split('\t').collect::<Vec<&str>>();
                 if fields.len() != 5 {
                     bail!("invalid flatpak record: expected five tab-separated columns");
                 }
-                let identity = format!("{}:{}", fields[4], fields[3]);
+                let identity: String = format!("{}:{}", fields[4], fields[3]);
                 Software::new(
                     c,
                     fields[0],
@@ -164,16 +167,16 @@ pub fn parse_command(c: &Collector, output: &str) -> Result<Vec<Software>> {
 // Read limits and regular-file checks apply even to symlink targets.
 /// Name part of a source RPM file name such as `openssl-3-3.0.8-150500.5.8.1.src.rpm`.
 fn source_rpm_name(file: &str) -> Option<&str> {
-    let stem = file
+    let stem: &str = file
         .strip_suffix(".src.rpm")
         .or_else(|| file.strip_suffix(".nosrc.rpm"))?;
-    let (rest, _release) = stem.rsplit_once('-')?;
-    let (name, _version) = rest.rsplit_once('-')?;
+    let (rest, _release): (&str, &str) = stem.rsplit_once('-')?;
+    let (name, _version): (&str, &str) = rest.rsplit_once('-')?;
     (!name.is_empty()).then_some(name)
 }
 
 fn read_file(path: &Path, limit: usize) -> Result<String> {
-    let file = File::options()
+    let file: File = File::options()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
@@ -181,7 +184,7 @@ fn read_file(path: &Path, limit: usize) -> Result<String> {
     if !file.metadata()?.is_file() {
         bail!("not a regular file: {}", path.display());
     }
-    let mut bytes = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
     file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         bail!("metadata file exceeded size limit: {}", path.display());
@@ -206,13 +209,13 @@ impl Budget {
     }
     fn read(&mut self, path: &Path) -> Result<String> {
         self.tick()?;
-        let text = read_file(path, self.bytes)?;
+        let text: String = read_file(path, self.bytes)?;
         self.bytes -= text.len();
         Ok(text)
     }
 }
 fn collect_files(c: &Collector, config: &Config) -> Result<Vec<Software>> {
-    let mut budget = Budget {
+    let mut budget: Budget = Budget {
         deadline: Instant::now() + Duration::from_secs(config.timeout_seconds),
         remaining: config.max_entries,
         bytes: config.max_output_bytes,
@@ -227,11 +230,15 @@ fn collect_files(c: &Collector, config: &Config) -> Result<Vec<Software>> {
     }
 }
 fn parse_apk(c: &Collector, text: &str) -> Result<Vec<Software>> {
-    let mut items = Vec::new();
-    for record in text.split("\n\n").filter(|s| !s.trim().is_empty()) {
-        let value = |prefix: &str| record.lines().find_map(|line| line.strip_prefix(prefix));
-        let name = value("P:").context("APK record missing name")?;
-        let version = value("V:").context("APK record missing version")?;
+    let mut items: Vec<Software> = Vec::new();
+    for record in text.split("\n\n").filter(|s: &&str| !s.trim().is_empty()) {
+        let value = |prefix: &str| -> Option<&str> {
+            record
+                .lines()
+                .find_map(|line: &str| line.strip_prefix(prefix))
+        };
+        let name: &str = value("P:").context("APK record missing name")?;
+        let version: &str = value("V:").context("APK record missing version")?;
         items.push(Software::new(
             c,
             name,
@@ -245,22 +252,22 @@ fn parse_apk(c: &Collector, text: &str) -> Result<Vec<Software>> {
     Ok(items)
 }
 fn parse_cargo(c: &Collector, text: &str) -> Result<Vec<Software>> {
-    let data: toml::Value = toml::from_str(text)?;
-    let records = data
+    let data: toml::Value = toml::from_str::<toml::Value>(text)?;
+    let records: &toml::map::Map<String, toml::Value> = data
         .get("v1")
         .and_then(toml::Value::as_table)
         .context("Cargo metadata missing v1 table")?;
-    let mut items = Vec::new();
+    let mut items: Vec<Software> = Vec::new();
     for (key, bins) in records {
-        let mut parts = key.splitn(3, ' ');
-        let name = parts.next().context("Cargo record missing name")?;
-        let version = parts.next().context("Cargo record missing version")?;
-        let origin = parts.next().context("Cargo record missing origin")?;
-        let bins = bins.as_array().context("Cargo binaries must be an array")?;
+        let mut parts: std::str::SplitN<'_, char> = key.splitn(3, ' ');
+        let name: &str = parts.next().context("Cargo record missing name")?;
+        let version: &str = parts.next().context("Cargo record missing version")?;
+        let origin: &str = parts.next().context("Cargo record missing origin")?;
+        let bins: &Vec<toml::Value> = bins.as_array().context("Cargo binaries must be an array")?;
         // Only count tracked packages with at least one binary still present.
-        let mut present = false;
+        let mut present: bool = false;
         for bin in bins {
-            let bin = bin.as_str().context("Cargo binary name must be a string")?;
+            let bin: &str = bin.as_str().context("Cargo binary name must be a string")?;
             if Path::new(bin).components().count() != 1 || bin == "." || bin == ".." {
                 bail!("invalid Cargo binary name");
             }
@@ -285,38 +292,43 @@ fn parse_cargo(c: &Collector, text: &str) -> Result<Vec<Software>> {
     Ok(items)
 }
 fn python(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
-    let mut items = Vec::new();
+    let mut items: Vec<Software> = Vec::new();
     for entry in fs::read_dir(&c.path)? {
         budget.tick()?;
-        let path = entry?.path();
+        let path: PathBuf = entry?.path();
         if path
             .extension()
-            .is_none_or(|ext| ext != "dist-info" && ext != "egg-info")
+            .is_none_or(|ext: &std::ffi::OsStr| ext != "dist-info" && ext != "egg-info")
         {
             continue;
         }
-        let metadata = if path.is_dir() {
-            path.join(if path.extension().is_some_and(|x| x == "dist-info") {
-                "METADATA"
-            } else {
-                "PKG-INFO"
-            })
+        let metadata: PathBuf = if path.is_dir() {
+            path.join(
+                if path
+                    .extension()
+                    .is_some_and(|x: &std::ffi::OsStr| x == "dist-info")
+                {
+                    "METADATA"
+                } else {
+                    "PKG-INFO"
+                },
+            )
         } else {
             path.clone()
         };
-        let text = budget.read(&metadata)?;
-        let headers = text.split("\n\n").next().unwrap_or("");
-        let field = |key: &str| {
+        let text: String = budget.read(&metadata)?;
+        let headers: &str = text.split("\n\n").next().unwrap_or("");
+        let field = |key: &str| -> Option<&str> {
             headers
                 .lines()
-                .find_map(|s| s.strip_prefix(key))
+                .find_map(|s: &str| s.strip_prefix(key))
                 .map(str::trim)
         };
-        let name = field("Name:")
-            .filter(|s| !s.is_empty())
+        let name: &str = field("Name:")
+            .filter(|s: &&str| !s.is_empty())
             .context("Python metadata missing Name")?;
-        let version = field("Version:")
-            .filter(|s| !s.is_empty())
+        let version: &str = field("Version:")
+            .filter(|s: &&str| !s.is_empty())
             .context("Python metadata missing Version")?;
         items.push(Software::new(
             c,
@@ -331,11 +343,11 @@ fn python(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
     Ok(items)
 }
 fn npm(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
-    let mut roots = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(&c.path)? {
         budget.tick()?;
-        let entry = entry?;
-        let name = entry.file_name();
+        let entry: fs::DirEntry = entry?;
+        let name: std::ffi::OsString = entry.file_name();
         if name.as_encoded_bytes().starts_with(b".") {
             continue;
         }
@@ -348,19 +360,19 @@ fn npm(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
             roots.push(entry.path());
         }
     }
-    let mut items = Vec::new();
+    let mut items: Vec<Software> = Vec::new();
     for root in roots {
-        let path = root.join("package.json");
-        let text = budget.read(&path)?;
-        let data: serde_json::Value = serde_json::from_str(&text)?;
-        let name = data
+        let path: PathBuf = root.join("package.json");
+        let text: String = budget.read(&path)?;
+        let data: serde_json::Value = serde_json::from_str::<serde_json::Value>(&text)?;
+        let name: &str = data
             .get("name")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .filter(|s: &&str| !s.is_empty())
             .context("npm metadata missing name")?;
-        let version = data
+        let version: &str = data
             .get("version")
-            .and_then(|v| v.as_str())
+            .and_then(|v: &serde_json::Value| v.as_str())
             .context("npm metadata missing version")?;
         items.push(Software::new(
             c,
@@ -378,19 +390,19 @@ fn filesystem(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
     if !fs::metadata(&c.path)?.is_dir() {
         bail!("filesystem root must be a directory: {}", c.path.display());
     }
-    let mut items = Vec::new();
-    let mut seen = HashSet::<PathBuf>::new();
+    let mut items: Vec<Software> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::<PathBuf>::new();
     for entry in WalkDir::new(&c.path)
         .max_depth(c.max_depth)
         .follow_links(false)
     {
         budget.tick()?;
-        let entry = entry?;
+        let entry: walkdir::DirEntry = entry?;
         if entry.depth() == 0 || entry.file_type().is_dir() {
             continue;
         }
-        let path = entry.path();
-        let metadata = match fs::metadata(path) {
+        let path: &Path = entry.path();
+        let metadata: fs::Metadata = match fs::metadata(path) {
             Ok(m) => m,
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound && entry.file_type().is_symlink() =>
@@ -402,11 +414,11 @@ fn filesystem(c: &Collector, budget: &mut Budget) -> Result<Vec<Software>> {
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             continue;
         }
-        let resolved = fs::canonicalize(path)?;
+        let resolved: PathBuf = fs::canonicalize(path)?;
         if !seen.insert(resolved.clone()) {
             continue;
         }
-        let name = resolved
+        let name: std::borrow::Cow<'_, str> = resolved
             .file_name()
             .context("executable has no filename")?
             .to_string_lossy();
@@ -436,8 +448,8 @@ mod tests {
     }
     #[test]
     fn dpkg_filters_removed_and_rejects_malformed() {
-        let c = c(Kind::Dpkg, Path::new("/usr/bin/dpkg-query"));
-        let items = parse_command(
+        let c: Collector = c(Kind::Dpkg, Path::new("/usr/bin/dpkg-query"));
+        let items: Vec<Software> = parse_command(
             &c,
             "libssl3:amd64\t3.0.11-1~deb12u2+b1\tamd64\tinstalled\topenssl\t3.0.11-1~deb12u2\n\
              old\t1\tall\tconfig-files\told\t1\n\
@@ -455,8 +467,8 @@ mod tests {
     }
     #[test]
     fn parses_package_formats() {
-        let root = Path::new("/tmp");
-        let rpm = parse_command(
+        let root: &Path = Path::new("/tmp");
+        let rpm: Vec<Software> = parse_command(
             &c(Kind::Rpm, root),
             "libopenssl3\t0:3.0.8-150500.5.8.1\tx86_64\topenssl-3-3.0.8-150500.5.8.1.src.rpm\n\
              gpg-pubkey\t0:1-2\t(none)\t(none)\n",
@@ -473,7 +485,7 @@ mod tests {
             1
         );
         assert_eq!(parse_command(&c(Kind::Snap, root), "Name Version Rev Tracking Publisher Notes\nhello 1.0 42 latest/stable canonical -\n").unwrap().len(), 1);
-        let fp = parse_command(
+        let fp: Vec<Software> = parse_command(
             &c(Kind::Flatpak, root),
             "org.app.Test\t\tx86_64\tstable\tsystem\norg.app.Test\t\tx86_64\tbeta\tsystem\n",
         )
@@ -489,8 +501,8 @@ mod tests {
     }
     #[test]
     fn passive_scans_and_scoped_npm() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let tmp: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let root: &Path = tmp.path();
         fs::create_dir(root.join("demo-1.dist-info")).unwrap();
         fs::write(
             root.join("demo-1.dist-info/METADATA"),
@@ -501,7 +513,7 @@ mod tests {
             collect_files(&c(Kind::Python, root), &Config::default()).unwrap()[0].name,
             "demo"
         );
-        let modules = root.join("node_modules");
+        let modules: PathBuf = root.join("node_modules");
         fs::create_dir_all(modules.join("@scope/app")).unwrap();
         fs::write(
             modules.join("@scope/app/package.json"),
@@ -514,24 +526,25 @@ mod tests {
                 .as_deref(),
             Some("2.0")
         );
-        let binary = root.join("do-not-run");
+        let binary: PathBuf = root.join("do-not-run");
         fs::write(&binary, "#!/bin/sh\nexit 99\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::symlink(&binary, root.join("alias")).unwrap();
         std::os::unix::fs::symlink(root, root.join("loop")).unwrap();
-        let files = collect_files(&c(Kind::Filesystem, root), &Config::default()).unwrap();
+        let files: Vec<Software> =
+            collect_files(&c(Kind::Filesystem, root), &Config::default()).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].version.is_none());
     }
     #[test]
     fn cargo_checks_presence_and_scan_limits_fail_closed() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp: tempfile::TempDir = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("bin")).unwrap();
         fs::write(tmp.path().join("bin/rg"), "binary").unwrap();
-        let c = c(Kind::Cargo, tmp.path());
-        let data = "[v1]\n\"ripgrep 14.1.1 (registry+https://example.test)\" = [\"rg\"]\n\"gone 1.0.0 (registry+https://example.test)\" = [\"gone\"]\n";
+        let c: Collector = c(Kind::Cargo, tmp.path());
+        let data: &str = "[v1]\n\"ripgrep 14.1.1 (registry+https://example.test)\" = [\"rg\"]\n\"gone 1.0.0 (registry+https://example.test)\" = [\"gone\"]\n";
         assert_eq!(parse_cargo(&c, data).unwrap().len(), 1);
-        let cfg = Config {
+        let cfg: Config = Config {
             max_output_bytes: 1,
             ..Config::default()
         };

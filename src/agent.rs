@@ -58,10 +58,10 @@ struct AgentState {
 }
 
 fn save(path: &Path, state: &AgentState) -> Result<()> {
-    let mut temp = path.as_os_str().to_os_string();
+    let mut temp: std::ffi::OsString = path.as_os_str().to_os_string();
     temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let mut file = OpenOptions::new()
+    let temp: PathBuf = PathBuf::from(temp);
+    let mut file: File = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
@@ -72,7 +72,7 @@ fn save(path: &Path, state: &AgentState) -> Result<()> {
     fs::rename(&temp, path)?;
     File::open(
         path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
+            .filter(|p: &&Path| !p.as_os_str().is_empty())
             .unwrap_or(Path::new(".")),
     )?
     .sync_all()?;
@@ -80,38 +80,42 @@ fn save(path: &Path, state: &AgentState) -> Result<()> {
 }
 
 fn kernel_hostname() -> Result<String> {
-    let mut buf = [0u8; 256];
+    let mut buf: [u8; 256] = [0u8; 256];
     // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates on success
     // when the name fits, and we cap the read at the first NUL or the buffer end.
     if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
         return Err(std::io::Error::last_os_error()).context("gethostname; pass --hostname");
     }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let end: usize = buf.iter().position(|&b: &u8| b == 0).unwrap_or(buf.len());
     String::from_utf8(buf[..end].to_vec()).context("non-UTF-8 hostname; pass --hostname")
 }
 
 /// Parses the os-release(5) KEY=value format, including simple quoting.
 fn parse_os_release(text: &str) -> std::collections::HashMap<String, String> {
     text.lines()
-        .filter_map(|line| line.trim().split_once('='))
-        .filter(|(key, _)| !key.starts_with('#'))
-        .map(|(key, value)| {
-            let value = value.trim();
-            let value = value
+        .filter_map(|line: &str| line.trim().split_once('='))
+        .filter(|(key, _): &(&str, &str)| !key.starts_with('#'))
+        .map(|(key, value): (&str, &str)| {
+            let value: &str = value.trim();
+            let value: &str = value
                 .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .and_then(|v: &str| v.strip_suffix('"'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|v: &str| v.strip_suffix('\''))
+                })
                 .unwrap_or(value);
             (
                 key.to_string(),
                 value.replace("\\\"", "\"").replace("\\\\", "\\"),
             )
         })
-        .collect()
+        .collect::<std::collections::HashMap<String, String>>()
 }
 
 fn os_release(path: &Path) -> Result<std::collections::HashMap<String, String>> {
-    let text = match fs::read_to_string(path) {
+    let text: String = match fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             fs::read_to_string("/usr/lib/os-release")?
         }
@@ -121,14 +125,14 @@ fn os_release(path: &Path) -> Result<std::collections::HashMap<String, String>> 
 }
 
 async fn acknowledge(mut response: reqwest::Response, sequence: i64) -> Result<()> {
-    let mut bytes = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if bytes.len() + chunk.len() > 4096 {
             bail!("oversized server acknowledgment; pending snapshot retained");
         }
         bytes.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
+    let value: serde_json::Value = serde_json::from_slice::<serde_json::Value>(&bytes)
         .context("invalid server acknowledgment; pending snapshot retained")?;
     if value["accepted"] != true || value["sequence"].as_i64() != Some(sequence) {
         bail!("unexpected server acknowledgment; pending snapshot retained");
@@ -137,12 +141,12 @@ async fn acknowledge(mut response: reqwest::Response, sequence: i64) -> Result<(
 }
 
 pub async fn run(options: Options, config: Config) -> Result<()> {
-    let origin = reqwest::Url::parse(&options.server)?;
-    let loopback = origin.host_str().is_some_and(|h| {
+    let origin: reqwest::Url = reqwest::Url::parse(&options.server)?;
+    let loopback: bool = origin.host_str().is_some_and(|h: &str| {
         h == "localhost"
             || h == "[::1]"
             || h.parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
+                .is_ok_and(|ip: std::net::IpAddr| ip.is_loopback())
     });
     if !(origin.scheme() == "https" || origin.scheme() == "http" && loopback)
         || !origin.username().is_empty()
@@ -155,12 +159,13 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
             "server must be an HTTPS origin (or HTTP loopback), without credentials, path, query or fragment"
         );
     }
-    let release = match (&options.os, &options.os_version) {
-        (Some(_), Some(_)) => Default::default(),
-        _ => os_release(Path::new("/etc/os-release"))
-            .context("cannot detect OS; pass --os and --os-version")?,
-    };
-    let host = Host {
+    let release: std::collections::HashMap<String, String> =
+        match (&options.os, &options.os_version) {
+            (Some(_), Some(_)) => Default::default(),
+            _ => os_release(Path::new("/etc/os-release"))
+                .context("cannot detect OS; pass --os and --os-version")?,
+        };
+    let host: Host = Host {
         id: options.host_id,
         hostname: match options.hostname {
             Some(name) => name,
@@ -196,19 +201,21 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
         },
     }
     .validate()?;
-    let token = std::env::var("INVENTORY_TOKEN")
+    let token: String = std::env::var("INVENTORY_TOKEN")
         .context("set INVENTORY_TOKEN to this host's upload credential")?;
     if token.len() < 32 {
         bail!("INVENTORY_TOKEN must be at least 32 characters");
     }
-    let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
+    let mut bearer: reqwest::header::HeaderValue =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;
     bearer.set_sensitive(true);
-    let mut client = reqwest::Client::builder()
+    let mut client: reqwest::ClientBuilder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none());
     if let Some(path) = &options.ca_cert {
-        let pem = fs::read(path).with_context(|| format!("read CA file {}", path.display()))?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        let pem: Vec<u8> =
+            fs::read(path).with_context(|| format!("read CA file {}", path.display()))?;
+        let certs: Vec<reqwest::Certificate> = reqwest::Certificate::from_pem_bundle(&pem)
             .with_context(|| format!("parse CA file {}", path.display()))?;
         if certs.is_empty() {
             bail!("CA file {} contains no certificates", path.display());
@@ -217,11 +224,11 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
             client = client.add_root_certificate(cert);
         }
     }
-    let client = client.build()?;
-    let endpoint = origin.join("v1/inventory")?;
-    let mut lock = options.state.as_os_str().to_os_string();
+    let client: reqwest::Client = client.build()?;
+    let endpoint: reqwest::Url = origin.join("v1/inventory")?;
+    let mut lock: std::ffi::OsString = options.state.as_os_str().to_os_string();
     lock.push(".lock");
-    let lock = OpenOptions::new()
+    let lock: File = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -230,7 +237,7 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
         .open(PathBuf::from(lock))?;
     lock.try_lock_exclusive()
         .context("another agent is using this state file")?;
-    let mut state = match fs::read(&options.state) {
+    let mut state: AgentState = match fs::read(&options.state) {
         Ok(bytes) => serde_json::from_slice::<AgentState>(&bytes)
             .context("invalid agent state; do not reset the sequence")?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => AgentState {
@@ -254,12 +261,12 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
     }
     loop {
         if state.pending.is_none() {
-            let mut inventory = Inventory {
+            let mut inventory: Inventory = Inventory {
                 schema_version: 1,
                 ..Inventory::default()
             };
             crate::scan(&mut inventory, &config).await;
-            let submission = Submission {
+            let submission: Submission = Submission {
                 protocol_version: 1,
                 host: host.clone(),
                 sequence: state
@@ -275,17 +282,21 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
             state.pending = Some(submission);
             save(&options.state, &state)?;
         }
-        let pending = state
+        let pending: &Submission = state
             .pending
             .as_ref()
             .expect("pending saved before transmission");
-        let response = client
+        let response: Result<reqwest::Response, reqwest::Error> = client
             .post(endpoint.clone())
             .header(reqwest::header::AUTHORIZATION, bearer.clone())
             .json(pending)
             .send()
             .await;
-        let failed_collectors = pending.inventory.collectors.values().any(|c| !c.success);
+        let failed_collectors: bool = pending
+            .inventory
+            .collectors
+            .values()
+            .any(|c: &crate::model::CollectorState| !c.success);
         match response {
             Ok(response) if response.status().is_success() => {
                 acknowledge(response, pending.sequence).await?;
@@ -301,7 +312,7 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
                 }
             }
             Ok(response) => {
-                let status = response.status();
+                let status: reqwest::StatusCode = response.status();
                 if options.once || status.is_client_error() {
                     bail!("submission returned {status}; pending snapshot retained");
                 }
@@ -316,7 +327,7 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
         }
         // A failed delivery retries sooner than the scan interval, so a short server
         // outage does not delay inventory by a whole (e.g. 12h) scan period.
-        let delay = if state.pending.is_some() {
+        let delay: u64 = if state.pending.is_some() {
             config.interval_seconds.min(RETRY_SECONDS)
         } else {
             config.interval_seconds
@@ -329,13 +340,14 @@ pub async fn run(options: Options, config: Config) -> Result<()> {
 mod tests {
     #[test]
     fn parses_os_release() {
-        let arch = super::parse_os_release(
+        let arch: std::collections::HashMap<String, String> = super::parse_os_release(
             "NAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\n# c=d\n",
         );
         assert_eq!(arch["ID"], "arch");
         assert_eq!(arch["NAME"], "Arch Linux");
         assert!(!arch.contains_key("VERSION_ID"));
-        let derivative = super::parse_os_release("ID=endeavouros\nID_LIKE=arch\nVERSION_ID='1'\n");
+        let derivative: std::collections::HashMap<String, String> =
+            super::parse_os_release("ID=endeavouros\nID_LIKE=arch\nVERSION_ID='1'\n");
         assert_eq!(derivative["ID"], "endeavouros");
         assert_eq!(derivative["VERSION_ID"], "1");
     }

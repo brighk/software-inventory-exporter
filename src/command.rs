@@ -6,7 +6,7 @@ use tokio::{
 };
 
 async fn read_limited(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
     reader
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
@@ -19,7 +19,7 @@ async fn read_limited(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Ve
 
 /// Only configured, trusted package-manager binaries are executed. No shell.
 pub async fn run(path: &Path, args: &[&str], timeout: Duration, limit: usize) -> Result<String> {
-    let mut child = Command::new(path)
+    let mut child: tokio::process::Child = Command::new(path)
         .args(args)
         .env("LC_ALL", "C")
         .env("TERM", "dumb")
@@ -29,10 +29,10 @@ pub async fn run(path: &Path, args: &[&str], timeout: Duration, limit: usize) ->
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("start {}", path.display()))?;
-    let stdout = child.stdout.take().context("missing stdout pipe")?;
-    let stderr = child.stderr.take().context("missing stderr pipe")?;
+    let stdout: tokio::process::ChildStdout = child.stdout.take().context("missing stdout pipe")?;
+    let stderr: tokio::process::ChildStderr = child.stderr.take().context("missing stderr pipe")?;
     let operation = async {
-        let (out, err, status) = tokio::try_join!(
+        let (out, err, status): (Vec<u8>, Vec<u8>, std::process::ExitStatus) = tokio::try_join!(
             read_limited(stdout, limit),
             read_limited(stderr, limit),
             async { child.wait().await.map_err(anyhow::Error::from) }
@@ -48,7 +48,7 @@ pub async fn run(path: &Path, args: &[&str], timeout: Duration, limit: usize) ->
         }
         String::from_utf8(out).context("command output is not UTF-8")
     };
-    let result = match tokio::time::timeout(timeout, operation).await {
+    let result: Result<String> = match tokio::time::timeout(timeout, operation).await {
         Ok(result) => result,
         Err(_) => Err(anyhow::anyhow!(
             "command timed out after {}s",
